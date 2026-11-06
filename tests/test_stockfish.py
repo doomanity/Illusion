@@ -1,3 +1,5 @@
+import os
+
 import chess
 import chess.engine
 import pytest
@@ -94,3 +96,44 @@ def test_brilliant_detector_accepts_stockfish_as_the_evaluator():
     board = chess.Board(QUEEN_INTO_PAWN)
     report = classify(board, chess.Move.from_uci("e2e5"), StockfishEngine(FakeUci()))
     assert report.is_brilliant  # flat evals: the sacrifice looks equal-best
+
+
+class FakeSimpleEngine(FakeUci):
+    """Engine that only supports some options, like our own Rust engine."""
+
+    def __init__(self, options, fail_configure=False):
+        super().__init__()
+        self.options = options
+        self.configured = []
+        self.fail_configure = fail_configure
+
+    def configure(self, settings):
+        if self.fail_configure:
+            raise chess.engine.EngineError("boom")
+        self.configured.append(settings)
+
+
+def test_from_path_only_sets_options_the_engine_supports(monkeypatch):
+    fake = FakeSimpleEngine(options={"Hash": object()})
+    monkeypatch.setattr(chess.engine.SimpleEngine, "popen_uci", lambda path: fake)
+    StockfishEngine.from_path("whatever", depth=5, threads=4, hash_mb=32)
+    assert fake.configured == [{"Hash": 32}]
+
+
+def test_from_path_quits_the_engine_if_setup_fails(monkeypatch):
+    fake = FakeSimpleEngine(options={"Hash": object()}, fail_configure=True)
+    monkeypatch.setattr(chess.engine.SimpleEngine, "popen_uci", lambda path: fake)
+    with pytest.raises(chess.engine.EngineError):
+        StockfishEngine.from_path("whatever")
+    assert fake.quit_called
+
+
+RUST_ENGINE = os.path.join(os.path.dirname(__file__), "..", "engine", "target", "release", "illusion")
+
+
+@pytest.mark.skipif(not os.path.exists(RUST_ENGINE), reason="build it first: cd engine && cargo build --release")
+def test_rust_engine_works_as_the_judge():
+    with StockfishEngine.from_path(RUST_ENGINE, depth=6, hash_mb=16) as judge:
+        mate_in_two = chess.Board("k7/8/8/1K6/8/8/8/7R w - - 0 1")
+        assert judge.move_value(mate_in_two, chess.Move.from_uci("b5b6")) > MATE - 1000
+        assert abs(judge.value(chess.Board())) < 100

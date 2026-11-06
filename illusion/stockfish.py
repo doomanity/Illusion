@@ -28,7 +28,12 @@ class StockfishEngine:
         cls, path: str = "stockfish", depth: int = DEFAULT_DEPTH, threads: int = 1, hash_mb: int = 64
     ) -> "StockfishEngine":
         uci_engine = chess.engine.SimpleEngine.popen_uci(path)
-        uci_engine.configure({"Threads": threads, "Hash": hash_mb})
+        try:
+            wanted = {"Threads": threads, "Hash": hash_mb}
+            uci_engine.configure({name: value for name, value in wanted.items() if name in uci_engine.options})
+        except Exception:
+            uci_engine.quit()  # never leave the engine process running if setup fails
+            raise
         return cls(uci_engine, depth)
 
     def value(self, board: chess.Board, depth: int | None = None) -> int:

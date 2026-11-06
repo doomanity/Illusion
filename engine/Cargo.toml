@@ -1,0 +1,22 @@
+[package]
+name = "illusion-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone UCI chess engine for Illusion"
+
+[lib]
+name = "illusion_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "illusion"
+path = "src/main.rs"
+
+[dependencies]
+shakmaty = "0.30"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
