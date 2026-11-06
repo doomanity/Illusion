@@ -1,0 +1,3 @@
+-r requirements.txt
+torch
+maia3 @ git+https://github.com/CSSLab/maia3.git

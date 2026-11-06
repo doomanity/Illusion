@@ -4,11 +4,13 @@ import chess
 import chess.pgn
 
 import arena
+from illusion import EloModel, Engine
 
 
 def test_play_game_respects_the_ply_limit(monkeypatch):
     monkeypatch.setattr(arena, "MAX_PLIES", 6)
-    record = arena.play_game(depth=1, opponent_elo=1000, illusion_is_white=True, rng=random.Random(0))
+    model = EloModel(1000)
+    record = arena.play_game(Engine(1), model, depth=1, illusion_is_white=True, rng=random.Random(0))
     assert len(record.board.move_stack) == 6
     assert record.illusion_score in (0.0, 0.5, 1.0)
 
@@ -31,3 +33,14 @@ def test_pgn_names_both_players():
     game = arena.to_pgn(arena.GameRecord(board, illusion_is_white=False, traps=[]), 1200)
     assert game.headers["Black"] == "Illusion"
     assert game.headers["White"] == "SimHuman1200"
+
+
+def test_default_flags_build_the_built_in_components():
+    args = arena.parse_args([])
+    assert isinstance(arena.build_judge(args), Engine)
+    assert isinstance(arena.build_model(args), EloModel)
+
+
+def test_flags_are_parsed():
+    args = arena.parse_args(["--stockfish", "/usr/games/stockfish", "--maia3", "23m", "--opp-elo", "1700", "--device", "cuda"])
+    assert (args.stockfish, args.maia3, args.opp_elo, args.device) == ("/usr/games/stockfish", "23m", 1700, "cuda")

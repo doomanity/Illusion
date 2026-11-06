@@ -25,6 +25,12 @@ PROMOTION_BONUS = 1.0
 RECAPTURE_BONUS = 1.0
 
 
+def sample_move(dist: MoveProbabilities, rng: random.Random | None = None) -> chess.Move:
+    """Draw one move from a probability list."""
+    rng = rng or random.Random()
+    return rng.choices([move for move, _ in dist], weights=[p for _, p in dist])[0]
+
+
 class OpponentModel(Protocol):
     def predict(self, board: chess.Board) -> MoveProbabilities:
         """Most likely replies with their probabilities, best first."""
@@ -72,9 +78,7 @@ class EloModel:
         return self.distribution(board)[: self.top_k]
 
     def sample(self, board: chess.Board, rng: random.Random | None = None) -> chess.Move:
-        rng = rng or random.Random()
-        dist = self.distribution(board)
-        return rng.choices([m for m, _ in dist], weights=[p for _, p in dist])[0]
+        return sample_move(self.distribution(board), rng)
 
     def _logit(self, board: chess.Board, move: chess.Move) -> float:
         quality = self._engine.move_value(board, move, 1) / self.temperature

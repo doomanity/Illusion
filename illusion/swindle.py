@@ -2,14 +2,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol
 
 import chess
 
 from .opponent import OpponentModel
-from .search import Engine, is_mate_score
+from .search import is_mate_score
 
 SCORE_CLIP = 2000  # stops mate scores from wrecking the averages
 DEFAULT_TOLERANCE = 60  # how much worse than best a trap move may be, in centipawns
+
+
+class SearchBackend(Protocol):
+    """Anything that can score positions: our own `Engine` or `StockfishEngine`."""
+
+    def value(self, board: chess.Board, depth: int) -> int:
+        """Score from the side to move's view."""
+
+    def move_value(self, board: chess.Board, move: chess.Move, depth: int) -> int:
+        """Score of playing `move`, from the mover's view."""
 
 
 @dataclass(frozen=True)
@@ -30,7 +41,7 @@ def clip(score: float) -> float:
 
 
 def _expected_score(
-    board: chess.Board, move: chess.Move, minimax: int, engine: Engine, model: OpponentModel, depth: int
+    board: chess.Board, move: chess.Move, minimax: int, engine: SearchBackend, model: OpponentModel, depth: int
 ) -> float:
     """Average our score over the opponent's likely replies to `move`."""
     board.push(move)
@@ -50,7 +61,7 @@ def _expected_score(
 
 def choose(
     board: chess.Board,
-    engine: Engine,
+    engine: SearchBackend,
     model: OpponentModel,
     depth: int = 3,
     tolerance: int = DEFAULT_TOLERANCE,
