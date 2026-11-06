@@ -257,3 +257,28 @@ fn own_book_can_be_switched_off() {
     engine.wait_for("info depth", Duration::from_secs(5));
     engine.wait_for("bestmove", Duration::from_secs(5));
 }
+
+#[test]
+fn trap_options_are_advertised() {
+    let mut engine = Engine::start();
+    engine.send("uci");
+    engine.wait_for("option name Swindle type check default false", Duration::from_secs(5));
+    engine.wait_for("option name OpponentElo", Duration::from_secs(5));
+    engine.wait_for("option name SwindleTolerance", Duration::from_secs(5));
+    engine.wait_for("uciok", Duration::from_secs(5));
+}
+
+#[test]
+fn trap_mode_plays_a_legal_move_on_time() {
+    let fen = "r1b2rk1/pp1nqppp/2pbpn2/3p4/2PP4/2NBPN2/PPQ2PPP/R1B2RK1 w - - 4 9";
+    let mut engine = Engine::start();
+    engine.send("setoption name Swindle value true");
+    engine.send("setoption name OpponentElo value 1000");
+    engine.send(&format!("position fen {fen}"));
+    let started = Instant::now();
+    engine.send("go movetime 500");
+    let line = engine.wait_for("bestmove", Duration::from_secs(5));
+    assert!(started.elapsed() < Duration::from_millis(900));
+    let mv = line.split_whitespace().nth(1).unwrap();
+    assert!(is_legal_uci(&pos(fen), mv), "{mv}");
+}

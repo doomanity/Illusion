@@ -11,13 +11,16 @@ use shakmaty::uci::UciMove;
 use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Position};
 
 use crate::book::Book;
-use crate::search::{position_key, Limits, Searcher};
+use crate::search::{position_key, Limits, SearchResult, Searcher};
+use crate::swindle::{self, Settings, DEFAULT_OPPONENT_ELO, DEFAULT_TOLERANCE};
 
 pub const NAME: &str = "Illusion";
 pub const DEFAULT_HASH_MB: usize = 64;
 pub const DEFAULT_OVERHEAD_MS: u64 = 30;
 const SEARCH_STACK_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MOVES_TO_GO: u64 = 30;
+/// Share of the move's time the normal search gets when trap mode is on; the rest goes to traps.
+const SEARCH_SHARE_WITH_SWINDLE: f64 = 0.5;
 
 /// Cheap unpredictable number for picking among book moves (not for anything security related).
 fn random_u64() -> u64 {
@@ -129,6 +132,8 @@ pub struct Uci {
     overhead_ms: u64,
     book: Book,
     use_book: bool,
+    swindle: Option<Settings>,
+    swindle_settings: Settings,
 }
 
 impl Default for Uci {
@@ -151,6 +156,8 @@ impl Uci {
             overhead_ms: DEFAULT_OVERHEAD_MS,
             book: Book::built_in(),
             use_book: true,
+            swindle: None,
+            swindle_settings: Settings::default(),
         }
     }
 
@@ -165,6 +172,9 @@ impl Uci {
                 println!("option name Hash type spin default {DEFAULT_HASH_MB} min 1 max 4096");
                 println!("option name Move Overhead type spin default {DEFAULT_OVERHEAD_MS} min 0 max 5000");
                 println!("option name OwnBook type check default true");
+                println!("option name Swindle type check default false");
+                println!("option name OpponentElo type spin default {DEFAULT_OPPONENT_ELO} min 400 max 2800");
+                println!("option name SwindleTolerance type spin default {DEFAULT_TOLERANCE} min 0 max 300");
                 println!("uciok");
             }
             "isready" => println!("readyok"),
@@ -203,9 +213,22 @@ impl Uci {
         let Some(value_at) = value_at else { return };
         let name = args[1..value_at].join(" ").to_lowercase();
         let value = args[value_at + 1..].join(" ");
-        if name == "ownbook" {
-            self.use_book = value.eq_ignore_ascii_case("true");
-            return;
+        let on = value.eq_ignore_ascii_case("true");
+        match name.as_str() {
+            "ownbook" => self.use_book = on,
+            "swindle" => self.swindle = on.then_some(self.swindle_settings),
+            "opponentelo" | "swindletolerance" => {
+                let Ok(number) = value.parse::<i32>() else { return };
+                if name == "opponentelo" {
+                    self.swindle_settings.opponent_elo = number.clamp(400, 2800);
+                } else {
+                    self.swindle_settings.tolerance = number.clamp(0, 300);
+                }
+                if self.swindle.is_some() {
+                    self.swindle = Some(self.swindle_settings);
+                }
+            }
+            _ => {}
         }
         match (name.as_str(), value.parse::<usize>()) {
             ("hash", Ok(mb)) => {
@@ -236,12 +259,18 @@ impl Uci {
             return;
         }
         let limits = limits_for(&params, self.pos.turn(), self.overhead_ms);
+        // trap mode only in real games: it needs a clock to split, and analysis wants the true best move
+        let swindle = self.swindle.filter(|_| limits.soft_time.is_some() && !params.infinite);
         let (pos, history) = (self.pos.clone(), self.history.clone());
         let searcher = Arc::clone(&self.searcher);
         self.stop.store(false, Ordering::Relaxed);
         let worker = std::thread::Builder::new().stack_size(SEARCH_STACK_BYTES).spawn(move || {
-            let result = searcher.lock().unwrap().search(&pos, &history, limits);
-            match result.best_move {
+            let mut searcher = searcher.lock().unwrap();
+            let best = match swindle {
+                Some(settings) => search_with_traps(&mut searcher, &pos, &history, limits, settings),
+                None => searcher.search(&pos, &history, limits).best_move,
+            };
+            match best {
                 Some(m) => println!("bestmove {}", m.to_uci(CastlingMode::Standard)),
                 None => println!("bestmove 0000"),
             }
@@ -254,6 +283,42 @@ impl Uci {
             let _ = handle.join();
         }
     }
+}
+
+/// Normal search on part of the time, then spend the rest looking for a trap.
+fn search_with_traps(
+    searcher: &mut Searcher,
+    pos: &Chess,
+    history: &[u64],
+    limits: Limits,
+    settings: Settings,
+) -> Option<shakmaty::Move> {
+    let start = Instant::now();
+    let soft = limits.soft_time.expect("trap mode needs a clock");
+    let share = |d: Option<Duration>| d.map(|d| d.mul_f64(SEARCH_SHARE_WITH_SWINDLE));
+    let main_limits = Limits { soft_time: share(limits.soft_time), hard_time: share(limits.hard_time), ..limits };
+    let main: SearchResult = searcher.search(pos, history, main_limits);
+
+    let printing = std::mem::replace(&mut searcher.print_info, false);
+    let choice = swindle::choose(searcher, pos, history, &main, settings, start + soft);
+    searcher.print_info = printing;
+
+    let Some(choice) = choice else { return main.best_move };
+    if Some(choice.mv) != main.best_move {
+        let name = |m: shakmaty::Move| m.to_uci(CastlingMode::Standard).to_string();
+        println!(
+            "info string trap {} (expected {:+.0}) over {} (expected {:+.0}) vs elo {}",
+            name(choice.mv),
+            choice.expected,
+            main.best_move.map_or_else(String::new, name),
+            choice.best_expected,
+            settings.opponent_elo
+        );
+    }
+    if choice.brilliant {
+        println!("info string brilliant move !!");
+    }
+    Some(choice.mv)
 }
 
 pub fn run() {

@@ -211,6 +211,11 @@ impl Searcher {
         }
     }
 
+    /// Has the GUI asked us to stop?
+    pub fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
     pub fn new_game(&mut self) {
         self.tt.clear();
         self.history.iter_mut().flatten().for_each(|row| row.fill(0));

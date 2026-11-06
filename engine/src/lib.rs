@@ -4,5 +4,6 @@ pub mod book;
 pub mod eval;
 pub mod search;
 pub mod see;
+pub mod swindle;
 pub mod tt;
 pub mod uci;
