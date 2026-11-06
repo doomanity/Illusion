@@ -18,7 +18,7 @@ pub const NAME: &str = "Illusion";
 pub const DEFAULT_HASH_MB: usize = 64;
 pub const DEFAULT_OVERHEAD_MS: u64 = 30;
 const SEARCH_STACK_BYTES: usize = 64 * 1024 * 1024;
-const DEFAULT_MOVES_TO_GO: u64 = 30;
+const DEFAULT_MOVES_TO_GO: u64 = 20;
 /// Share of the move's time the normal search gets when trap mode is on; the rest goes to traps.
 const SEARCH_SHARE_WITH_SWINDLE: f64 = 0.5;
 

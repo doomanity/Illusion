@@ -216,7 +216,7 @@ fn time_allocation_is_sane_across_time_controls() {
         assert!(hard <= Duration::from_millis(time.max(1)), "never plans to use more than the clock: {time}");
     }
     let (soft, _) = allocate_time(60_000, 0, None, 30);
-    assert!(soft >= Duration::from_millis(1500) && soft <= Duration::from_millis(2500));
+    assert!(soft >= Duration::from_millis(2500) && soft <= Duration::from_millis(3500));
     let (with_inc, _) = allocate_time(60_000, 2_000, None, 30);
     assert!(with_inc > soft);
 }

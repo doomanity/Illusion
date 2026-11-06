@@ -1,5 +1,6 @@
 //! Static evaluation: tapered piece-square tables (PeSTO) plus mobility, bishop pair,
-//! passed pawns and rook files. Scores are centipawns from the side to move's view.
+//! passed pawns, rook files, king safety and endgame know-how.
+//! Scores are centipawns from the side to move's view.
 
 use shakmaty::{attacks, Bitboard, Chess, Color, Piece, Position, Role};
 use std::sync::OnceLock;
@@ -18,6 +19,27 @@ const ROOK_OPEN_FILE: (i32, i32) = (25, 10);
 const ROOK_SEMI_OPEN_FILE: (i32, i32) = (12, 8);
 const PASSED_MG: [i32; 8] = [0, 0, 5, 10, 20, 35, 60, 0];
 const PASSED_EG: [i32; 8] = [0, 5, 10, 25, 45, 80, 130, 0];
+
+const PASSED_FREE_EG: [i32; 8] = [0, 0, 2, 5, 10, 20, 35, 0]; // nothing standing in front
+const PASSER_KING_DISTANCE: [i32; 8] = [0, 0, 0, 1, 2, 3, 4, 0]; // kings racing to the pawn
+const ENEMY_KING_DISTANCE_WEIGHT: i32 = 5;
+const OWN_KING_DISTANCE_WEIGHT: i32 = 2;
+
+// King safety: how dangerous each piece type is when it hits squares around the enemy king.
+const KING_ATTACK_WEIGHT: [i32; 4] = [2, 2, 3, 5]; // knight, bishop, rook, queen
+const KING_DANGER_DIVISOR: i32 = 3;
+const MAX_KING_DANGER: i32 = 400;
+const SHIELD_MISSING: i32 = 20;
+const SHIELD_ADVANCED: i32 = 10;
+const OPEN_FILE_NEAR_KING: i32 = 15;
+
+// Endgame: drive the bare king to the edge, and admit that a lone minor piece can't win.
+const MOP_UP_MIN_ADVANTAGE: i32 = 300;
+const MOP_UP_EDGE: i32 = 10;
+const MOP_UP_CLOSER: i32 = 4;
+const NO_WIN_WITHOUT_PAWNS: i32 = 350;
+const NO_WIN_DIVISOR: i32 = 8;
+const FIFTY_MOVE_SCALE: i32 = 200; // the eval shrinks as the 50-move counter climbs
 
 // Mobility: (baseline squares, middlegame weight, endgame weight) for knight, bishop, rook, queen.
 const MOBILITY: [(i32, i32, i32); 4] = [(4, 4, 4), (6, 5, 5), (7, 2, 4), (13, 1, 2)];
@@ -211,6 +233,51 @@ pub fn is_pawn_ending(pos: &Chess, side: Color) -> bool {
     (board.by_color(side) & !(board.pawns() | board.kings())).is_empty()
 }
 
+fn distance(a: usize, b: usize) -> i32 {
+    let files = (a & 7) as i32 - (b & 7) as i32;
+    let ranks = (a >> 3) as i32 - (b >> 3) as i32;
+    files.abs().max(ranks.abs())
+}
+
+fn distance_from_center(square: usize) -> i32 {
+    let (file, rank) = ((square & 7) as i32, (square >> 3) as i32);
+    (2 * file - 7).abs() / 2 + (2 * rank - 7).abs() / 2
+}
+
+/// The king, the squares next to it and one more rank in front.
+fn king_zone(king: usize, is_white: bool) -> u64 {
+    let near = u64::from(attacks::king_attacks(shakmaty::Square::new(king as u32))) | (1u64 << king);
+    let forward = if is_white { near << 8 } else { near >> 8 };
+    near | forward
+}
+
+/// Middlegame penalty for missing or pushed pawns in front of a castled-looking king.
+fn pawn_shield_penalty(king: usize, is_white: bool, own_pawns: u64, all_pawns: u64) -> i32 {
+    let relative_rank = if is_white { king >> 3 } else { 7 - (king >> 3) };
+    if relative_rank > 1 {
+        return 0;
+    }
+    let king_file = king & 7;
+    let mut penalty = 0;
+    for file in king_file.saturating_sub(1)..=(king_file + 1).min(7) {
+        let on_file = FILE_A << file;
+        let shield = own_pawns & on_file;
+        if shield == 0 {
+            penalty += SHIELD_MISSING;
+            if all_pawns & on_file == 0 {
+                penalty += OPEN_FILE_NEAR_KING;
+            }
+            continue;
+        }
+        let nearest = if is_white { shield.trailing_zeros() as usize } else { 63 - shield.leading_zeros() as usize };
+        let rank_gap = ((nearest >> 3) as i32 - (king >> 3) as i32).abs();
+        if rank_gap > 2 {
+            penalty += SHIELD_ADVANCED;
+        }
+    }
+    penalty
+}
+
 pub fn evaluate(pos: &Chess) -> i32 {
     let board = pos.board();
     let tables = tables();
@@ -227,6 +294,14 @@ pub fn evaluate(pos: &Chess) -> i32 {
     let mut eg = [0i32; 2];
     let mut bishops = [0i32; 2];
     let mut phase = 0i32;
+    let kings = [
+        board.king_of(Color::White).map_or(0, |sq| sq as usize),
+        board.king_of(Color::Black).map_or(0, |sq| sq as usize),
+    ];
+    let zones = [king_zone(kings[0], true), king_zone(kings[1], false)];
+    let mut king_attackers = [0i32; 2]; // pieces of `side` hitting the enemy king zone
+    let mut king_attack_units = [0i32; 2];
+    let mut piece_material = [0i32; 2];
 
     for square in occupied {
         let Some(piece) = board.piece_at(square) else { continue };
@@ -244,13 +319,29 @@ pub fn evaluate(pos: &Chess) -> i32 {
                     let relative_rank = if side == 0 { sq >> 3 } else { 7 - (sq >> 3) };
                     mg[side] += PASSED_MG[relative_rank];
                     eg[side] += PASSED_EG[relative_rank];
+                    let stop = if side == 0 { sq + 8 } else { sq.wrapping_sub(8) };
+                    if stop < 64 {
+                        if u64::from(occupied) & (1u64 << stop) == 0 {
+                            eg[side] += PASSED_FREE_EG[relative_rank];
+                        }
+                        let race = ENEMY_KING_DISTANCE_WEIGHT * distance(kings[1 - side], stop)
+                            - OWN_KING_DISTANCE_WEIGHT * distance(kings[side], stop);
+                        eg[side] += race * PASSER_KING_DISTANCE[relative_rank];
+                    }
                 }
             }
             Role::Knight | Role::Bishop | Role::Rook | Role::Queen => {
                 if piece.role == Role::Bishop {
                     bishops[side] += 1;
                 }
-                let reachable = attacks::attacks(square, piece, occupied)
+                piece_material[side] += EG_VALUE[role];
+                let hits = attacks::attacks(square, piece, occupied);
+                let zone_hits = (u64::from(hits) & zones[1 - side]).count_ones() as i32;
+                if zone_hits > 0 {
+                    king_attackers[side] += 1;
+                    king_attack_units[side] += zone_hits * KING_ATTACK_WEIGHT[role - 1];
+                }
+                let reachable = hits
                     & !own[side]
                     & !Bitboard::from(enemy_pawn_attacks[side]);
                 let (baseline, mg_weight, eg_weight) = MOBILITY[role - 1];
@@ -278,12 +369,36 @@ pub fn evaluate(pos: &Chess) -> i32 {
             mg[side] += BISHOP_PAIR.0;
             eg[side] += BISHOP_PAIR.1;
         }
+        if king_attackers[side] >= 2 {
+            let units = king_attack_units[side];
+            mg[side] += (units * units / KING_DANGER_DIVISOR).min(MAX_KING_DANGER);
+        }
+        mg[side] -= pawn_shield_penalty(kings[side], side == 0, pawns[side], pawns[0] | pawns[1]);
     }
 
     let phase = phase.min(TOTAL_PHASE);
     let mg_score = mg[0] - mg[1];
-    let eg_score = eg[0] - eg[1];
-    let white_view = (mg_score * phase + eg_score * (TOTAL_PHASE - phase)) / TOTAL_PHASE;
+    let mut eg_score = eg[0] - eg[1];
+    eg_score += endgame_adjustment(eg_score, kings, pawns, piece_material);
+    let mut white_view = (mg_score * phase + eg_score * (TOTAL_PHASE - phase)) / TOTAL_PHASE;
+    white_view = white_view * (FIFTY_MOVE_SCALE - pos.halfmoves().min(100) as i32) / FIFTY_MOVE_SCALE;
     let from_side_to_move = if pos.turn().is_white() { white_view } else { -white_view };
     from_side_to_move + TEMPO
+}
+
+/// Endgame corrections to the white-view endgame score.
+fn endgame_adjustment(eg_score: i32, kings: [usize; 2], pawns: [u64; 2], piece_material: [i32; 2]) -> i32 {
+    let (strong, weak) = if eg_score >= 0 { (0, 1) } else { (1, 0) };
+    let sign = if strong == 0 { 1 } else { -1 };
+    // a lone minor piece (or less) without pawns can't force mate
+    if pawns[strong] == 0 && piece_material[strong] - piece_material[weak] <= NO_WIN_WITHOUT_PAWNS {
+        return -eg_score + eg_score / NO_WIN_DIVISOR;
+    }
+    // winning against a bare king: push it to the edge and bring ours closer
+    if pawns[weak] == 0 && eg_score.abs() >= MOP_UP_MIN_ADVANTAGE {
+        let edge = distance_from_center(kings[weak]) * MOP_UP_EDGE;
+        let closer = (14 - 2 * distance(kings[0], kings[1])) * MOP_UP_CLOSER;
+        return sign * (edge + closer);
+    }
+    0
 }

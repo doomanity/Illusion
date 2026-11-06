@@ -154,13 +154,16 @@ pub fn time_scale(depth: i32, stable_iterations: u32, score_drop: i32) -> f64 {
     scale
 }
 
-/// Is it too late to start another iteration? (The next one takes about as long as everything so far.)
+/// Share of the budget after which a new iteration is not started (it would likely overrun).
+const START_ITERATION_SHARE: f64 = 0.6;
+
+/// Is it too late to start another iteration?
 pub fn should_stop_iterating(elapsed: Duration, soft: Duration, hard: Option<Duration>, scale: f64) -> bool {
     let mut budget = soft.mul_f64(scale);
     if let Some(hard) = hard {
         budget = budget.min(hard);
     }
-    elapsed * 2 >= budget
+    elapsed >= budget.mul_f64(START_ITERATION_SHARE)
 }
 
 /// UCI score text: `cp 35` or `mate 3` (negative when we are being mated).
@@ -437,7 +440,11 @@ impl Searcher {
             let quiet = is_quiet(m);
             let bad_capture = scores[i] < 0 && m.is_capture();
 
-            if !pv_node && !in_check && best > -MATE_BOUND && move_count > 0 {
+            let mut child = pos.clone();
+            child.play_unchecked(m);
+            let gives_check = child.is_check();
+
+            if !pv_node && !in_check && !gives_check && best > -MATE_BOUND && move_count > 0 {
                 if quiet && depth <= 4 && move_count as i32 >= 3 + depth * depth {
                     continue; // late move pruning
                 }
@@ -449,8 +456,6 @@ impl Searcher {
                 }
             }
 
-            let mut child = pos.clone();
-            child.play_unchecked(m);
             let child_key = position_key(&child);
             self.path.push(child_key);
             move_count += 1;
@@ -465,7 +470,7 @@ impl Searcher {
                     if pv_node {
                         reduction -= 1;
                     }
-                    if child.is_check() {
+                    if gives_check {
                         reduction -= 1;
                     }
                     if self.killers[ply].contains(&Some(m)) {

@@ -62,3 +62,36 @@ fn passed_pawns_are_valued_more_the_further_they_advance() {
     let near = evaluate(&pos("4k3/8/8/8/8/4P3/8/4K3 w - - 0 1"));
     assert!(far > near);
 }
+
+#[test]
+fn shuffling_towards_the_fifty_move_rule_shrinks_an_advantage() {
+    let fresh = evaluate(&pos("4k3/8/8/8/8/8/3PK3/2B5 w - - 0 60"));
+    let stale = evaluate(&pos("4k3/8/8/8/8/8/3PK3/2B5 w - - 80 60"));
+    assert!(stale < fresh, "{stale} vs {fresh}");
+}
+
+#[test]
+fn a_lone_bishop_is_not_winning() {
+    assert!(evaluate(&pos("4k3/8/8/8/8/8/4K3/2B5 w - - 0 1")).abs() < 80);
+}
+
+#[test]
+fn winning_side_wants_the_bare_king_on_the_edge() {
+    let center = evaluate(&pos("8/8/8/3k4/8/8/8/R3K3 w - - 0 1"));
+    let corner = evaluate(&pos("7k/8/8/8/8/8/8/R3K3 w - - 0 1"));
+    assert!(corner > center, "{corner} vs {center}");
+}
+
+#[test]
+fn a_broken_pawn_shield_costs_points() {
+    let safe = evaluate(&pos("r4rk1/ppp2ppp/8/8/8/8/PPP2PPP/R4RK1 w - - 0 1"));
+    let broken = evaluate(&pos("r4rk1/ppp2ppp/8/8/8/8/PPP5/R4RK1 w - - 0 1"));
+    assert!(broken < safe - 100, "{broken} vs {safe}");
+}
+
+#[test]
+fn pieces_swarming_the_king_are_dangerous() {
+    let calm = evaluate(&pos("6k1/5ppp/8/8/8/8/5PPP/NQ4K1 b - - 0 1"));
+    let attacked = evaluate(&pos("6k1/5ppp/8/5N2/6Q1/8/5PPP/6K1 b - - 0 1"));
+    assert!(attacked < calm - 100, "{attacked} vs {calm}");
+}

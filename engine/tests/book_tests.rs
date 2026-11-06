@@ -83,14 +83,14 @@ fn score_drop_extends_the_search() {
 #[test]
 fn iteration_stops_when_next_one_would_not_fit() {
     let soft = Duration::from_millis(1000);
-    assert!(!should_stop_iterating(Duration::from_millis(100), soft, None, 1.0));
-    assert!(should_stop_iterating(Duration::from_millis(500), soft, None, 1.0));
-    assert!(should_stop_iterating(Duration::from_millis(250), soft, None, 0.5));
+    assert!(!should_stop_iterating(Duration::from_millis(500), soft, None, 1.0));
+    assert!(should_stop_iterating(Duration::from_millis(600), soft, None, 1.0));
+    assert!(should_stop_iterating(Duration::from_millis(300), soft, None, 0.5));
 }
 
 #[test]
 fn hard_limit_caps_an_extended_budget() {
     let soft = Duration::from_millis(1000);
     let hard = Some(Duration::from_millis(1200));
-    assert!(should_stop_iterating(Duration::from_millis(600), soft, hard, 1.5));
+    assert!(should_stop_iterating(Duration::from_millis(720), soft, hard, 1.5));
 }
