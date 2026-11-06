@@ -226,3 +226,34 @@ fn startpos_fen_roundtrip_matches() {
     let from_startpos = parse_position(&["startpos"]).unwrap().0;
     assert_eq!(from_startpos, pos(START));
 }
+
+#[test]
+fn start_position_with_a_clock_answers_from_the_book() {
+    let mut engine = Engine::start();
+    engine.send("position startpos");
+    engine.send("go wtime 60000 btime 60000");
+    let started = Instant::now();
+    let line = engine.wait_for("bestmove", Duration::from_secs(5));
+    assert!(started.elapsed() < Duration::from_millis(500));
+    let mv = line.split_whitespace().nth(1).unwrap();
+    assert!(["e2e4", "d2d4", "c2c4", "g1f3"].contains(&mv), "{mv}");
+}
+
+#[test]
+fn fixed_depth_search_ignores_the_book() {
+    let mut engine = Engine::start();
+    engine.send("position startpos");
+    engine.send("go depth 3");
+    let line = engine.wait_for("bestmove", Duration::from_secs(10));
+    assert!(line.starts_with("bestmove "));
+}
+
+#[test]
+fn own_book_can_be_switched_off() {
+    let mut engine = Engine::start();
+    engine.send("setoption name OwnBook value false");
+    engine.send("position startpos");
+    engine.send("go movetime 200");
+    engine.wait_for("info depth", Duration::from_secs(5));
+    engine.wait_for("bestmove", Duration::from_secs(5));
+}

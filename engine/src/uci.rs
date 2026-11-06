@@ -10,6 +10,7 @@ use shakmaty::fen::Fen;
 use shakmaty::uci::UciMove;
 use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Position};
 
+use crate::book::Book;
 use crate::search::{position_key, Limits, Searcher};
 
 pub const NAME: &str = "Illusion";
@@ -17,6 +18,17 @@ pub const DEFAULT_HASH_MB: usize = 64;
 pub const DEFAULT_OVERHEAD_MS: u64 = 30;
 const SEARCH_STACK_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MOVES_TO_GO: u64 = 30;
+
+/// Cheap unpredictable number for picking among book moves (not for anything security related).
+fn random_u64() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let mut z = nanos.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
 
 /// How long to spend on one move: (soft limit, hard limit).
 ///
@@ -115,6 +127,8 @@ pub struct Uci {
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     overhead_ms: u64,
+    book: Book,
+    use_book: bool,
 }
 
 impl Default for Uci {
@@ -135,6 +149,8 @@ impl Uci {
             stop,
             worker: None,
             overhead_ms: DEFAULT_OVERHEAD_MS,
+            book: Book::built_in(),
+            use_book: true,
         }
     }
 
@@ -148,6 +164,7 @@ impl Uci {
                 println!("id author Brody and Claude");
                 println!("option name Hash type spin default {DEFAULT_HASH_MB} min 1 max 4096");
                 println!("option name Move Overhead type spin default {DEFAULT_OVERHEAD_MS} min 0 max 5000");
+                println!("option name OwnBook type check default true");
                 println!("uciok");
             }
             "isready" => println!("readyok"),
@@ -186,6 +203,10 @@ impl Uci {
         let Some(value_at) = value_at else { return };
         let name = args[1..value_at].join(" ").to_lowercase();
         let value = args[value_at + 1..].join(" ");
+        if name == "ownbook" {
+            self.use_book = value.eq_ignore_ascii_case("true");
+            return;
+        }
         match (name.as_str(), value.parse::<usize>()) {
             ("hash", Ok(mb)) => {
                 self.wait_for_search();
@@ -196,9 +217,25 @@ impl Uci {
         }
     }
 
+    /// A book move, if the book is on, this is a normal timed game search and the position is known.
+    fn book_move(&self, params: &GoParams) -> Option<String> {
+        let analysing = params.infinite || params.depth.is_some() || params.nodes.is_some();
+        if !self.use_book || analysing {
+            return None;
+        }
+        let mv = self.book.probe(&self.pos, random_u64())?;
+        Some(mv.to_uci(CastlingMode::Standard).to_string())
+    }
+
     fn go(&mut self, args: &[&str]) {
         self.wait_for_search();
-        let limits = limits_for(&parse_go(args), self.pos.turn(), self.overhead_ms);
+        let params = parse_go(args);
+        if let Some(book_move) = self.book_move(&params) {
+            println!("info string book move");
+            println!("bestmove {book_move}");
+            return;
+        }
+        let limits = limits_for(&params, self.pos.turn(), self.overhead_ms);
         let (pos, history) = (self.pos.clone(), self.history.clone());
         let searcher = Arc::clone(&self.searcher);
         self.stop.store(false, Ordering::Relaxed);

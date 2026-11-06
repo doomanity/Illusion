@@ -131,6 +131,38 @@ fn color_index(color: Color) -> usize {
     }
 }
 
+const STABLE_ITERATIONS_FOR_SHORT_TIME: u32 = 4;
+const STABLE_ITERATIONS_FOR_MEDIUM_TIME: u32 = 2;
+const MIN_DEPTH_FOR_EARLY_STOP: i32 = 8;
+const SCORE_DROP_THAT_EXTENDS_TIME: i32 = 30;
+
+/// How much of the soft time budget to use: less when the best move keeps coming out the
+/// same, more when the score just dropped and the engine may be in trouble.
+pub fn time_scale(depth: i32, stable_iterations: u32, score_drop: i32) -> f64 {
+    let mut scale = if depth < MIN_DEPTH_FOR_EARLY_STOP {
+        1.0
+    } else if stable_iterations >= STABLE_ITERATIONS_FOR_SHORT_TIME {
+        0.5
+    } else if stable_iterations >= STABLE_ITERATIONS_FOR_MEDIUM_TIME {
+        0.8
+    } else {
+        1.0
+    };
+    if score_drop >= SCORE_DROP_THAT_EXTENDS_TIME {
+        scale *= 1.5;
+    }
+    scale
+}
+
+/// Is it too late to start another iteration? (The next one takes about as long as everything so far.)
+pub fn should_stop_iterating(elapsed: Duration, soft: Duration, hard: Option<Duration>, scale: f64) -> bool {
+    let mut budget = soft.mul_f64(scale);
+    if let Some(hard) = hard {
+        budget = budget.min(hard);
+    }
+    elapsed * 2 >= budget
+}
+
 /// UCI score text: `cp 35` or `mate 3` (negative when we are being mated).
 pub fn format_score(score: i32) -> String {
     if score >= MATE_BOUND {
@@ -212,6 +244,8 @@ impl Searcher {
         let mut best_move = first;
         let mut best_score = -INF;
         let mut completed_depth = 0;
+        let mut stable_iterations = 0u32;
+        let mut previous_score: Option<i32> = None;
         self.root_best = Some(first);
 
         for depth in 1..=max_depth {
@@ -220,17 +254,21 @@ impl Searcher {
             if self.aborted {
                 break;
             }
+            let score_drop = previous_score.map_or(0, |previous| previous - score);
             best_score = score;
+            previous_score = Some(score);
             completed_depth = depth;
             if let Some(m) = self.root_best {
+                stable_iterations = if m == best_move { stable_iterations + 1 } else { 0 };
                 best_move = m;
             }
             if self.print_info {
                 self.print_iteration(pos, depth, score);
             }
             if let Some(soft) = self.limits.soft_time {
-                if self.start.elapsed() * 2 >= soft {
-                    break; // the next iteration would not finish in time
+                let scale = time_scale(depth, stable_iterations, score_drop);
+                if should_stop_iterating(self.start.elapsed(), soft, self.limits.hard_time, scale) {
+                    break; // the next iteration would not finish in time, or the move is settled
                 }
             }
             if score.abs() >= MATE_BOUND && depth >= 4 && self.limits.is_timed() {
