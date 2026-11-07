@@ -303,8 +303,14 @@ fn pawn_shield_penalty(king: usize, is_white: bool, own_pawns: u64, all_pawns: u
 
 /// Learned network if one is given, otherwise the hand-written eval.
 pub fn evaluate_with(pos: &Chess, network: Option<&Network>) -> i32 {
-    let Some(network) = network else { return evaluate(pos) };
-    let score = network.evaluate(pos.board(), pos.turn());
+    match network {
+        Some(network) => adjust_network_score(network.evaluate(pos.board(), pos.turn()), pos),
+        None => evaluate(pos),
+    }
+}
+
+/// The rules applied on top of a raw network score (currently the 50-move fade).
+pub fn adjust_network_score(score: i32, pos: &Chess) -> i32 {
     if endgame_rules_enabled() {
         fifty_move_scaled(score, pos)
     } else {

@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use shakmaty::zobrist::Zobrist64;
 use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Move, Position, Role};
 
-use crate::eval::{evaluate_with, is_pawn_ending, MATE, MATE_BOUND};
-use crate::nnue::{self, Network};
+use crate::eval::{adjust_network_score, evaluate, is_pawn_ending, MATE, MATE_BOUND};
+use crate::nnue::{self, Accumulator, Network};
 use crate::see::{role_value, see};
 use crate::tt::{Bound, Tt};
 
@@ -194,6 +194,7 @@ pub struct Searcher {
     root_best: Option<Move>,
     lmr: [[i32; 64]; 64],
     network: Option<Arc<Network>>,
+    accumulators: Vec<Accumulator>, // network inputs for the position at each ply
 }
 
 impl Searcher {
@@ -214,11 +215,23 @@ impl Searcher {
             root_best: None,
             lmr: lmr_table(),
             network: None,
+            accumulators: vec![Accumulator::default(); MAX_PLY + 1],
         }
     }
 
-    fn static_eval(&self, pos: &Chess) -> i32 {
-        evaluate_with(pos, self.network.as_deref())
+    fn static_eval(&self, pos: &Chess, ply: usize) -> i32 {
+        match &self.network {
+            Some(network) => adjust_network_score(network.output(&self.accumulators[ply], pos.turn()), pos),
+            None => evaluate(pos),
+        }
+    }
+
+    /// Bring the network inputs for `child` (one ply below `parent`) up to date.
+    fn prepare_child(&mut self, ply: usize, parent: &Chess, child: &Chess) {
+        if let Some(network) = &self.network {
+            let (done, next) = self.accumulators.split_at_mut(ply + 1);
+            network.update(&done[ply], parent.board(), child.board(), &mut next[0]);
+        }
     }
 
     /// Has the GUI asked us to stop?
@@ -236,6 +249,9 @@ impl Searcher {
     pub fn search(&mut self, pos: &Chess, game_history: &[u64], limits: Limits) -> SearchResult {
         self.start = Instant::now();
         self.network = nnue::active();
+        if let Some(network) = &self.network {
+            self.accumulators[0] = network.refresh(pos.board());
+        }
         self.nodes = 0;
         self.aborted = false;
         self.can_abort = false;
@@ -253,7 +269,7 @@ impl Searcher {
             return SearchResult { best_move: None, score, depth: 0, nodes: 0, pv: vec![] };
         };
         if legal.len() == 1 && self.limits.is_timed() {
-            return SearchResult { best_move: Some(first), score: self.static_eval(pos), depth: 0, nodes: 0, pv: vec![first] };
+            return SearchResult { best_move: Some(first), score: self.static_eval(pos, 0), depth: 0, nodes: 0, pv: vec![first] };
         }
 
         let max_depth = self.limits.max_depth.unwrap_or(MAX_PLY as i32 - 8).min(MAX_PLY as i32 - 8);
@@ -365,7 +381,7 @@ impl Searcher {
         }
         self.seldepth = self.seldepth.max(ply);
         if ply >= MAX_PLY - 1 {
-            return self.static_eval(pos);
+            return self.static_eval(pos, ply);
         }
         if ply > 0 {
             if self.is_draw(pos) {
@@ -400,7 +416,7 @@ impl Searcher {
             }
         }
 
-        let static_eval = if in_check { -INF } else { self.static_eval(pos) };
+        let static_eval = if in_check { -INF } else { self.static_eval(pos, ply) };
 
         if !pv_node && !in_check {
             if depth <= 6 && beta.abs() < MATE_BOUND && static_eval - 90 * depth >= beta {
@@ -409,6 +425,7 @@ impl Searcher {
             if allow_null && depth >= 3 && static_eval >= beta && !is_pawn_ending(pos, pos.turn()) {
                 let reduction = 3 + depth / 4 + ((static_eval - beta) / 200).min(2);
                 if let Ok(child) = pos.clone().swap_turn() {
+                    self.prepare_child(ply, pos, &child);
                     let child_key = position_key(&child);
                     self.path.push(child_key);
                     let score =
@@ -464,6 +481,7 @@ impl Searcher {
                 }
             }
 
+            self.prepare_child(ply, pos, &child);
             let child_key = position_key(&child);
             self.path.push(child_key);
             move_count += 1;
@@ -540,10 +558,10 @@ impl Searcher {
         }
         self.seldepth = self.seldepth.max(ply);
         if ply >= MAX_PLY - 1 {
-            return self.static_eval(pos);
+            return self.static_eval(pos, ply);
         }
         let in_check = pos.is_check();
-        let mut best = if in_check { -INF } else { self.static_eval(pos) };
+        let mut best = if in_check { -INF } else { self.static_eval(pos, ply) };
         if !in_check {
             if best >= beta {
                 return best;
@@ -576,6 +594,7 @@ impl Searcher {
             }
             let mut child = pos.clone();
             child.play_unchecked(m);
+            self.prepare_child(ply, pos, &child);
             let score = -self.quiesce(&child, ply + 1, -beta, -alpha);
             if self.aborted {
                 return 0;

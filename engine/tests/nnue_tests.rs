@@ -132,3 +132,51 @@ fn training_lowers_the_loss_on_a_simple_pattern() {
     let up_sample = sample("4k3/8/8/8/8/8/8/3QK3 w - - 0 1", 0, Outcome::Draw);
     assert!(float_eval(&params, &up_sample) > 200.0);
 }
+
+#[test]
+fn patched_inputs_match_a_full_rebuild_after_any_move() {
+    let network = quantize(&initial_params(5));
+    let starts = [
+        START,
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", // castling both ways
+        "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",       // en passant
+        "n1n5/PPPk4/8/8/8/8/4Kppp/5N1N b - - 0 1",                            // promotions
+    ];
+    let mut rng = Rng::new(99);
+    let mut checked = 0;
+    for fen in starts {
+        for _ in 0..20 {
+            let mut position = pos(fen);
+            let mut accumulator = network.refresh(position.board());
+            for _ in 0..120 {
+                let moves = position.legal_moves();
+                if moves.is_empty() {
+                    break;
+                }
+                let mut next = position.clone();
+                next.play_unchecked(moves[rng.below(moves.len())]);
+                let mut patched = accumulator;
+                network.update(&accumulator, position.board(), next.board(), &mut patched);
+                assert_eq!(patched, network.refresh(next.board()), "after a move from {}", position.board());
+                (position, accumulator) = (next, patched);
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 5000);
+}
+
+#[test]
+fn search_with_a_network_agrees_with_its_own_static_eval_at_depth_zero_positions() {
+    // a position with no captures or checks: quiescence just returns the static eval
+    let network = quantize(&initial_params(8));
+    nnue::set_active(Some(network.clone()));
+    let quiet = pos("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1");
+    let mut searcher = Searcher::new(4, Arc::new(AtomicBool::new(false)));
+    let result = searcher.search(&quiet, &[], illusion_engine::search::Limits::depth(1));
+    nnue::set_active(None);
+    let best = result.best_move.unwrap();
+    let after = quiet.clone().play(best).unwrap();
+    let expected = -illusion_engine::eval::evaluate_with(&after, Some(&network));
+    assert_eq!(result.score, expected);
+}

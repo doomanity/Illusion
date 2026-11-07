@@ -8,7 +8,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
-use shakmaty::{Board, Color, Piece, Square};
+use shakmaty::{Board, Color, Piece, Role, Square};
 
 pub const INPUTS: usize = 768;
 pub const HIDDEN: usize = 128;
@@ -89,30 +89,86 @@ impl Network {
         bytes
     }
 
-    /// Centipawns from the side to move's view.
-    pub fn evaluate(&self, board: &Board, side_to_move: Color) -> i32 {
-        let mut accumulators = [[0i16; HIDDEN]; 2];
-        accumulators[0].copy_from_slice(&self.input_bias);
-        accumulators[1].copy_from_slice(&self.input_bias);
+    /// Hidden layer inputs for a whole board, computed from scratch.
+    pub fn refresh(&self, board: &Board) -> Accumulator {
+        let mut accumulator = Accumulator { views: [[0; HIDDEN]; 2] };
+        for view in &mut accumulator.views {
+            view.copy_from_slice(&self.input_bias);
+        }
         for square in board.occupied() {
-            let Some(piece) = board.piece_at(square) else { continue };
-            for (view, perspective) in [side_to_move, !side_to_move].into_iter().enumerate() {
-                let row = feature(perspective, piece, square) * HIDDEN;
-                let weights = &self.input_weights[row..row + HIDDEN];
-                for (acc, w) in accumulators[view].iter_mut().zip(weights) {
-                    *acc = acc.wrapping_add(*w);
+            if let Some(piece) = board.piece_at(square) {
+                self.toggle(&mut accumulator, piece, square, true);
+            }
+        }
+        accumulator
+    }
+
+    /// `parent` was computed for `before`; write the accumulator for `after` into `out` by
+    /// patching only the pieces that changed (works for any move, including castling,
+    /// en passant, promotions and null moves).
+    pub fn update(&self, parent: &Accumulator, before: &Board, after: &Board, out: &mut Accumulator) {
+        *out = *parent;
+        for color in Color::ALL {
+            for role in Role::ALL {
+                let piece = Piece { color, role };
+                let (old, new) = (before.by_piece(piece), after.by_piece(piece));
+                for square in old & !new {
+                    self.toggle(out, piece, square, false);
+                }
+                for square in new & !old {
+                    self.toggle(out, piece, square, true);
                 }
             }
         }
+    }
+
+    fn toggle(&self, accumulator: &mut Accumulator, piece: Piece, square: Square, add: bool) {
+        for (view, perspective) in Color::ALL.into_iter().enumerate() {
+            let row = feature(perspective, piece, square) * HIDDEN;
+            let weights = &self.input_weights[row..row + HIDDEN];
+            let values = &mut accumulator.views[view];
+            if add {
+                values.iter_mut().zip(weights).for_each(|(a, w)| *a = a.wrapping_add(*w));
+            } else {
+                values.iter_mut().zip(weights).for_each(|(a, w)| *a = a.wrapping_sub(*w));
+            }
+        }
+    }
+
+    /// Centipawns from the side to move's view, from a ready accumulator.
+    pub fn output(&self, accumulator: &Accumulator, side_to_move: Color) -> i32 {
+        let ours = &accumulator.views[color_index(side_to_move)];
+        let theirs = &accumulator.views[color_index(!side_to_move)];
         let mut sum = 0i32;
-        for (view, accumulator) in accumulators.iter().enumerate() {
+        for (view, values) in [ours, theirs].into_iter().enumerate() {
             let weights = &self.output_weights[view * HIDDEN..(view + 1) * HIDDEN];
-            for (&acc, &w) in accumulator.iter().zip(weights) {
-                sum += i32::from(acc.clamp(0, QA as i16)) * i32::from(w);
+            for (&a, &w) in values.iter().zip(weights) {
+                sum += i32::from(a.clamp(0, QA as i16)) * i32::from(w);
             }
         }
         (sum + self.output_bias) * SCALE / (QA * QB)
     }
+
+    /// Centipawns from the side to move's view (computed from scratch).
+    pub fn evaluate(&self, board: &Board, side_to_move: Color) -> i32 {
+        self.output(&self.refresh(board), side_to_move)
+    }
+}
+
+/// Hidden layer inputs for one position, seen from white (index 0) and black (index 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Accumulator {
+    pub views: [[i16; HIDDEN]; 2],
+}
+
+impl Default for Accumulator {
+    fn default() -> Self {
+        Accumulator { views: [[0; HIDDEN]; 2] }
+    }
+}
+
+fn color_index(color: Color) -> usize {
+    usize::from(color.is_black())
 }
 
 static ACTIVE: RwLock<Option<Arc<Network>>> = RwLock::new(None);

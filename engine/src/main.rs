@@ -8,7 +8,7 @@ use illusion_engine::uci;
 
 const USAGE: &str = "usage:
   illusion                                   run as a UCI engine
-  illusion bench [depth]                     speed test
+  illusion bench [depth] [--net file.nnue]   speed test
   illusion datagen <out.bin> [--games N] [--threads N] [--nodes N] [--net file.nnue]
   illusion train <out.nnue> <data.bin>... [--epochs N] [--threads N]";
 
@@ -90,6 +90,9 @@ fn run(raw: &[String]) -> Result<(), String> {
     let args = Args::parse(&raw[1..])?;
     match command.as_str() {
         "bench" => {
+            if let Some(net) = args.text_flag("net") {
+                nnue::set_active(Some(Network::load(Path::new(net))?));
+            }
             let depth = args.positional.first().and_then(|d| d.parse().ok()).unwrap_or(9);
             let (nodes, millis) = uci::bench(depth);
             println!("{nodes} nodes {millis} ms {} nps", nodes as u128 * 1000 / millis.max(1));
