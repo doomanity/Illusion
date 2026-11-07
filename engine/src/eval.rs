@@ -6,6 +6,8 @@ use shakmaty::{attacks, Bitboard, Chess, Color, Piece, Position, Role};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
+use crate::nnue::Network;
+
 static KING_SAFETY: AtomicBool = AtomicBool::new(false);
 static ENDGAME_RULES: AtomicBool = AtomicBool::new(true);
 
@@ -299,6 +301,22 @@ fn pawn_shield_penalty(king: usize, is_white: bool, own_pawns: u64, all_pawns: u
     penalty
 }
 
+/// Learned network if one is given, otherwise the hand-written eval.
+pub fn evaluate_with(pos: &Chess, network: Option<&Network>) -> i32 {
+    let Some(network) = network else { return evaluate(pos) };
+    let score = network.evaluate(pos.board(), pos.turn());
+    if endgame_rules_enabled() {
+        fifty_move_scaled(score, pos)
+    } else {
+        score
+    }
+}
+
+fn fifty_move_scaled(score: i32, pos: &Chess) -> i32 {
+    score * (FIFTY_MOVE_SCALE - pos.halfmoves().min(100) as i32) / FIFTY_MOVE_SCALE
+}
+
+/// Hand-written evaluation.
 pub fn evaluate(pos: &Chess) -> i32 {
     let king_safety = king_safety_enabled();
     let endgame_rules = endgame_rules_enabled();
@@ -409,7 +427,7 @@ pub fn evaluate(pos: &Chess) -> i32 {
     }
     let mut white_view = (mg_score * phase + eg_score * (TOTAL_PHASE - phase)) / TOTAL_PHASE;
     if endgame_rules {
-        white_view = white_view * (FIFTY_MOVE_SCALE - pos.halfmoves().min(100) as i32) / FIFTY_MOVE_SCALE;
+        white_view = fifty_move_scaled(white_view, pos);
     }
     let from_side_to_move = if pos.turn().is_white() { white_view } else { -white_view };
     from_side_to_move + TEMPO

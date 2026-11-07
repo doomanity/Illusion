@@ -12,6 +12,7 @@ use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Position};
 
 use crate::book::Book;
 use crate::eval;
+use crate::nnue;
 use crate::search::{position_key, Limits, SearchResult, Searcher};
 use crate::swindle::{self, Settings, DEFAULT_OPPONENT_ELO, DEFAULT_TOLERANCE};
 
@@ -173,6 +174,7 @@ impl Uci {
                 println!("option name Hash type spin default {DEFAULT_HASH_MB} min 1 max 4096");
                 println!("option name Move Overhead type spin default {DEFAULT_OVERHEAD_MS} min 0 max 5000");
                 println!("option name OwnBook type check default true");
+                println!("option name EvalFile type string default <empty>");
                 println!("option name KingSafety type check default {}", eval::king_safety_enabled());
                 println!("option name EndgameRules type check default {}", eval::endgame_rules_enabled());
                 println!("option name Swindle type check default false");
@@ -220,6 +222,10 @@ impl Uci {
         match name.as_str() {
             "ownbook" => self.use_book = on,
             "kingsafety" => eval::set_king_safety(on),
+            "evalfile" => {
+                self.wait_for_search();
+                load_network(&value);
+            }
             "endgamerules" => eval::set_endgame_rules(on),
             "swindle" => self.swindle = on.then_some(self.swindle_settings),
             "opponentelo" | "swindletolerance" => {
@@ -286,6 +292,26 @@ impl Uci {
     fn wait_for_search(&mut self) {
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
+        }
+    }
+}
+
+/// Load the network at `path`; an empty path or `<empty>` goes back to the hand-written eval.
+fn load_network(path: &str) {
+    let path = path.trim();
+    if path.is_empty() || path == "<empty>" {
+        nnue::set_active(None);
+        println!("info string using hand-written eval");
+        return;
+    }
+    match nnue::Network::load(std::path::Path::new(path)) {
+        Ok(network) => {
+            nnue::set_active(Some(network));
+            println!("info string loaded network {path}");
+        }
+        Err(message) => {
+            nnue::set_active(None);
+            println!("info string {message}, using hand-written eval");
         }
     }
 }

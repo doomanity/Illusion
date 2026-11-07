@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use shakmaty::zobrist::Zobrist64;
 use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Move, Position, Role};
 
-use crate::eval::{evaluate, is_pawn_ending, MATE, MATE_BOUND};
+use crate::eval::{evaluate_with, is_pawn_ending, MATE, MATE_BOUND};
+use crate::nnue::{self, Network};
 use crate::see::{role_value, see};
 use crate::tt::{Bound, Tt};
 
@@ -192,6 +193,7 @@ pub struct Searcher {
     path: Vec<u64>,
     root_best: Option<Move>,
     lmr: [[i32; 64]; 64],
+    network: Option<Arc<Network>>,
 }
 
 impl Searcher {
@@ -211,7 +213,12 @@ impl Searcher {
             path: Vec::with_capacity(MAX_PLY + 512),
             root_best: None,
             lmr: lmr_table(),
+            network: None,
         }
+    }
+
+    fn static_eval(&self, pos: &Chess) -> i32 {
+        evaluate_with(pos, self.network.as_deref())
     }
 
     /// Has the GUI asked us to stop?
@@ -228,6 +235,7 @@ impl Searcher {
     /// Search `pos`. `game_history` holds the keys of every earlier position in the game.
     pub fn search(&mut self, pos: &Chess, game_history: &[u64], limits: Limits) -> SearchResult {
         self.start = Instant::now();
+        self.network = nnue::active();
         self.nodes = 0;
         self.aborted = false;
         self.can_abort = false;
@@ -245,7 +253,7 @@ impl Searcher {
             return SearchResult { best_move: None, score, depth: 0, nodes: 0, pv: vec![] };
         };
         if legal.len() == 1 && self.limits.is_timed() {
-            return SearchResult { best_move: Some(first), score: evaluate(pos), depth: 0, nodes: 0, pv: vec![first] };
+            return SearchResult { best_move: Some(first), score: self.static_eval(pos), depth: 0, nodes: 0, pv: vec![first] };
         }
 
         let max_depth = self.limits.max_depth.unwrap_or(MAX_PLY as i32 - 8).min(MAX_PLY as i32 - 8);
@@ -357,7 +365,7 @@ impl Searcher {
         }
         self.seldepth = self.seldepth.max(ply);
         if ply >= MAX_PLY - 1 {
-            return evaluate(pos);
+            return self.static_eval(pos);
         }
         if ply > 0 {
             if self.is_draw(pos) {
@@ -392,7 +400,7 @@ impl Searcher {
             }
         }
 
-        let static_eval = if in_check { -INF } else { evaluate(pos) };
+        let static_eval = if in_check { -INF } else { self.static_eval(pos) };
 
         if !pv_node && !in_check {
             if depth <= 6 && beta.abs() < MATE_BOUND && static_eval - 90 * depth >= beta {
@@ -532,10 +540,10 @@ impl Searcher {
         }
         self.seldepth = self.seldepth.max(ply);
         if ply >= MAX_PLY - 1 {
-            return evaluate(pos);
+            return self.static_eval(pos);
         }
         let in_check = pos.is_check();
-        let mut best = if in_check { -INF } else { evaluate(pos) };
+        let mut best = if in_check { -INF } else { self.static_eval(pos) };
         if !in_check {
             if best >= beta {
                 return best;
