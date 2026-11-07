@@ -282,3 +282,15 @@ fn trap_mode_plays_a_legal_move_on_time() {
     let mv = line.split_whitespace().nth(1).unwrap();
     assert!(is_legal_uci(&pos(fen), mv), "{mv}");
 }
+
+#[test]
+fn eval_feature_toggles_are_advertised() {
+    let mut engine = Engine::start();
+    engine.send("uci");
+    engine.wait_for("option name KingSafety type check default false", Duration::from_secs(5));
+    engine.wait_for("option name EndgameRules type check default true", Duration::from_secs(5));
+    engine.send("setoption name KingSafety value true");
+    engine.send("position startpos");
+    engine.send("go depth 4");
+    engine.wait_for("bestmove", Duration::from_secs(5));
+}

@@ -1,7 +1,7 @@
 mod common;
 
 use common::{pos, START};
-use illusion_engine::eval::evaluate;
+use illusion_engine::eval::{evaluate, set_king_safety};
 
 /// Same position with colours swapped and the board flipped vertically.
 fn mirror(fen: &str) -> String {
@@ -84,6 +84,7 @@ fn winning_side_wants_the_bare_king_on_the_edge() {
 
 #[test]
 fn a_broken_pawn_shield_costs_points() {
+    set_king_safety(true);
     let safe = evaluate(&pos("r4rk1/ppp2ppp/8/8/8/8/PPP2PPP/R4RK1 w - - 0 1"));
     let broken = evaluate(&pos("r4rk1/ppp2ppp/8/8/8/8/PPP5/R4RK1 w - - 0 1"));
     assert!(broken < safe - 100, "{broken} vs {safe}");
@@ -91,6 +92,7 @@ fn a_broken_pawn_shield_costs_points() {
 
 #[test]
 fn pieces_swarming_the_king_are_dangerous() {
+    set_king_safety(true);
     let calm = evaluate(&pos("6k1/5ppp/8/8/8/8/5PPP/NQ4K1 b - - 0 1"));
     let attacked = evaluate(&pos("6k1/5ppp/8/5N2/6Q1/8/5PPP/6K1 b - - 0 1"));
     assert!(attacked < calm - 100, "{attacked} vs {calm}");

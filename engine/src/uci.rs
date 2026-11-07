@@ -11,6 +11,7 @@ use shakmaty::uci::UciMove;
 use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Position};
 
 use crate::book::Book;
+use crate::eval;
 use crate::search::{position_key, Limits, SearchResult, Searcher};
 use crate::swindle::{self, Settings, DEFAULT_OPPONENT_ELO, DEFAULT_TOLERANCE};
 
@@ -172,6 +173,8 @@ impl Uci {
                 println!("option name Hash type spin default {DEFAULT_HASH_MB} min 1 max 4096");
                 println!("option name Move Overhead type spin default {DEFAULT_OVERHEAD_MS} min 0 max 5000");
                 println!("option name OwnBook type check default true");
+                println!("option name KingSafety type check default {}", eval::king_safety_enabled());
+                println!("option name EndgameRules type check default {}", eval::endgame_rules_enabled());
                 println!("option name Swindle type check default false");
                 println!("option name OpponentElo type spin default {DEFAULT_OPPONENT_ELO} min 400 max 2800");
                 println!("option name SwindleTolerance type spin default {DEFAULT_TOLERANCE} min 0 max 300");
@@ -216,6 +219,8 @@ impl Uci {
         let on = value.eq_ignore_ascii_case("true");
         match name.as_str() {
             "ownbook" => self.use_book = on,
+            "kingsafety" => eval::set_king_safety(on),
+            "endgamerules" => eval::set_endgame_rules(on),
             "swindle" => self.swindle = on.then_some(self.swindle_settings),
             "opponentelo" | "swindletolerance" => {
                 let Ok(number) = value.parse::<i32>() else { return };

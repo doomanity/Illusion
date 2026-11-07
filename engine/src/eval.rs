@@ -3,7 +3,28 @@
 //! Scores are centipawns from the side to move's view.
 
 use shakmaty::{attacks, Bitboard, Chess, Color, Piece, Position, Role};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+
+static KING_SAFETY: AtomicBool = AtomicBool::new(false);
+static ENDGAME_RULES: AtomicBool = AtomicBool::new(true);
+
+/// Switch the newer, still-being-tested eval terms on or off (UCI options).
+pub fn set_king_safety(on: bool) {
+    KING_SAFETY.store(on, Ordering::Relaxed);
+}
+
+pub fn set_endgame_rules(on: bool) {
+    ENDGAME_RULES.store(on, Ordering::Relaxed);
+}
+
+pub fn king_safety_enabled() -> bool {
+    KING_SAFETY.load(Ordering::Relaxed)
+}
+
+pub fn endgame_rules_enabled() -> bool {
+    ENDGAME_RULES.load(Ordering::Relaxed)
+}
 
 pub const MATE: i32 = 30_000;
 pub const MATE_BOUND: i32 = MATE - 1_000; // scores beyond this mean "forced mate"
@@ -279,6 +300,8 @@ fn pawn_shield_penalty(king: usize, is_white: bool, own_pawns: u64, all_pawns: u
 }
 
 pub fn evaluate(pos: &Chess) -> i32 {
+    let king_safety = king_safety_enabled();
+    let endgame_rules = endgame_rules_enabled();
     let board = pos.board();
     let tables = tables();
     let occupied = board.occupied();
@@ -320,7 +343,7 @@ pub fn evaluate(pos: &Chess) -> i32 {
                     mg[side] += PASSED_MG[relative_rank];
                     eg[side] += PASSED_EG[relative_rank];
                     let stop = if side == 0 { sq + 8 } else { sq.wrapping_sub(8) };
-                    if stop < 64 {
+                    if endgame_rules && stop < 64 {
                         if u64::from(occupied) & (1u64 << stop) == 0 {
                             eg[side] += PASSED_FREE_EG[relative_rank];
                         }
@@ -337,7 +360,7 @@ pub fn evaluate(pos: &Chess) -> i32 {
                 piece_material[side] += EG_VALUE[role];
                 let hits = attacks::attacks(square, piece, occupied);
                 let zone_hits = (u64::from(hits) & zones[1 - side]).count_ones() as i32;
-                if zone_hits > 0 {
+                if king_safety && zone_hits > 0 {
                     king_attackers[side] += 1;
                     king_attack_units[side] += zone_hits * KING_ATTACK_WEIGHT[role - 1];
                 }
@@ -373,15 +396,21 @@ pub fn evaluate(pos: &Chess) -> i32 {
             let units = king_attack_units[side];
             mg[side] += (units * units / KING_DANGER_DIVISOR).min(MAX_KING_DANGER);
         }
-        mg[side] -= pawn_shield_penalty(kings[side], side == 0, pawns[side], pawns[0] | pawns[1]);
+        if king_safety {
+            mg[side] -= pawn_shield_penalty(kings[side], side == 0, pawns[side], pawns[0] | pawns[1]);
+        }
     }
 
     let phase = phase.min(TOTAL_PHASE);
     let mg_score = mg[0] - mg[1];
     let mut eg_score = eg[0] - eg[1];
-    eg_score += endgame_adjustment(eg_score, kings, pawns, piece_material);
+    if endgame_rules {
+        eg_score += endgame_adjustment(eg_score, kings, pawns, piece_material);
+    }
     let mut white_view = (mg_score * phase + eg_score * (TOTAL_PHASE - phase)) / TOTAL_PHASE;
-    white_view = white_view * (FIFTY_MOVE_SCALE - pos.halfmoves().min(100) as i32) / FIFTY_MOVE_SCALE;
+    if endgame_rules {
+        white_view = white_view * (FIFTY_MOVE_SCALE - pos.halfmoves().min(100) as i32) / FIFTY_MOVE_SCALE;
+    }
     let from_side_to_move = if pos.turn().is_white() { white_view } else { -white_view };
     from_side_to_move + TEMPO
 }
