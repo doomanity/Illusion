@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use shakmaty::Color;
 
@@ -21,7 +21,7 @@ const CHUNK_POSITIONS: usize = 2048;
 const TEACHER_HASH_MB: u32 = 16;
 /// Mate scores and anything beyond this are stored as this many centipawns.
 pub const MAX_TEACHER_SCORE: i32 = 3000;
-const PROGRESS_EVERY_POSITIONS: usize = 100_000;
+const PROGRESS_EVERY: Duration = Duration::from_secs(20);
 
 /// A UCI engine running as a child process.
 pub struct UciEngine {
@@ -193,6 +193,7 @@ pub fn relabel(input: &Path, output: &Path, config: &RelabelConfig) -> io::Resul
         // write chunks in input order so the output always lines up with the input
         let mut pending = BTreeMap::new();
         let (mut next_to_write, mut written) = (0usize, 0usize);
+        let mut last_report = Instant::now();
         for message in receiver {
             let (index, bytes) = match message {
                 Ok(done) => done,
@@ -205,10 +206,10 @@ pub fn relabel(input: &Path, output: &Path, config: &RelabelConfig) -> io::Resul
             while let Some(bytes) = pending.remove(&next_to_write) {
                 writer.write_all(&bytes)?;
                 writer.flush()?;
-                let before = written;
                 written += bytes.len() / SAMPLE_BYTES;
                 next_to_write += 1;
-                if written / PROGRESS_EVERY_POSITIONS > before / PROGRESS_EVERY_POSITIONS {
+                if last_report.elapsed() >= PROGRESS_EVERY {
+                    last_report = Instant::now();
                     let rate = written as f64 / start.elapsed().as_secs_f64().max(0.001);
                     let left_hours = (total - already - written) as f64 / rate / 3600.0;
                     println!("{} / {} positions, {rate:.0} per second, about {left_hours:.1} h left", already + written, total);
