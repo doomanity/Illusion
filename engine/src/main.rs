@@ -3,6 +3,7 @@ use std::process::ExitCode;
 
 use illusion_engine::datagen::{self, DatagenConfig};
 use illusion_engine::nnue::{self, Network};
+use illusion_engine::relabel::{self, RelabelConfig};
 use illusion_engine::train::{self, TrainConfig};
 use illusion_engine::uci;
 
@@ -10,7 +11,8 @@ const USAGE: &str = "usage:
   illusion                                   run as a UCI engine
   illusion bench [depth] [--net file.nnue]   speed test
   illusion datagen <out.bin> [--games N] [--threads N] [--nodes N] [--net file.nnue]
-  illusion train <out.nnue> <data.bin>... [--epochs N] [--threads N]";
+  illusion train <out.nnue> <data.bin>... [--epochs N] [--threads N]
+  illusion relabel <in.bin> <out.bin> --teacher stockfish.exe [--nodes N] [--threads N]";
 
 /// Positional arguments and `--name value` flags.
 struct Args {
@@ -82,6 +84,22 @@ fn train_command(args: &Args) -> Result<(), String> {
     train::train(samples, Path::new(out), &config).map(|_| ()).map_err(|e| e.to_string())
 }
 
+fn relabel_command(args: &Args) -> Result<(), String> {
+    let [input, output] = args.positional.as_slice() else {
+        return Err("relabel needs an input and an output file".into());
+    };
+    if input == output {
+        return Err("input and output must be different files".into());
+    }
+    let teacher = args.text_flag("teacher").ok_or("relabel needs --teacher <path to engine>")?;
+    let config = RelabelConfig {
+        teacher: PathBuf::from(teacher),
+        nodes: args.flag("nodes", 5_000)?,
+        threads: args.flag("threads", default_threads().saturating_sub(1).max(1))?,
+    };
+    relabel::relabel(Path::new(input), Path::new(output), &config).map_err(|e| e.to_string())
+}
+
 fn run(raw: &[String]) -> Result<(), String> {
     let Some(command) = raw.first() else {
         uci::run();
@@ -100,6 +118,7 @@ fn run(raw: &[String]) -> Result<(), String> {
         }
         "datagen" => datagen_command(&args),
         "train" => train_command(&args),
+        "relabel" => relabel_command(&args),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             Ok(())
