@@ -40,6 +40,19 @@ impl Engine {
         self.stdin.flush().unwrap();
     }
 
+    /// True if no line starting with `prefix` arrives within `wait`.
+    fn stays_quiet(&mut self, prefix: &str, wait: Duration) -> bool {
+        let deadline = Instant::now() + wait;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.lines.recv_timeout(left) {
+                Ok(line) if line.starts_with(prefix) => return false,
+                Ok(_) => {}
+                Err(_) => return true,
+            }
+        }
+    }
+
     /// Read lines until one starts with `prefix`; fail after `timeout`.
     fn wait_for(&mut self, prefix: &str, timeout: Duration) -> String {
         let deadline = Instant::now() + timeout;
@@ -129,7 +142,8 @@ fn finds_a_forced_mate_through_the_protocol() {
     let mut engine = Engine::start();
     engine.send("position fen k7/8/8/1K6/8/8/8/7R w - - 0 1");
     engine.send("go depth 6");
-    assert_eq!(engine.wait_for("bestmove", WAIT), "bestmove b5b6");
+    let line = engine.wait_for("bestmove", WAIT);
+    assert_eq!(line.split_whitespace().nth(1), Some("b5b6"), "{line}");
 }
 
 #[test]
@@ -195,6 +209,8 @@ fn parses_go_parameters() {
         }
     );
     assert!(parse_go(&["infinite"]).infinite);
+    let pondering = parse_go(&["ponder", "wtime", "1000", "btime", "1000"]);
+    assert!(pondering.ponder && !pondering.infinite);
     assert_eq!(parse_go(&["movetime", "250"]).movetime, Some(250));
 }
 
@@ -293,4 +309,53 @@ fn eval_feature_toggles_are_advertised() {
     engine.send("position startpos");
     engine.send("go depth 4");
     engine.wait_for("bestmove", Duration::from_secs(5));
+}
+
+#[test]
+fn best_move_comes_with_an_expected_reply() {
+    let mut engine = Engine::start();
+    engine.send("uci");
+    engine.wait_for("option name Ponder type check", Duration::from_secs(5));
+    engine.send("position startpos moves e2e4");
+    engine.send("go depth 8");
+    let line = engine.wait_for("bestmove", Duration::from_secs(10));
+    let words: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(words.len(), 4, "{line}");
+    assert_eq!(words[2], "ponder");
+    let position = illusion_engine::uci::parse_position(&["startpos", "moves", "e2e4", words[1]]).unwrap().0;
+    assert!(is_legal_uci(&position, words[3]), "e2e4 {} then {}", words[1], words[3]);
+}
+
+#[test]
+fn pondering_waits_for_the_opponent_then_uses_its_own_clock() {
+    let mut engine = Engine::start();
+    engine.send("position startpos moves e2e4 e7e5");
+    engine.send("go ponder wtime 10000 btime 10000");
+    assert!(engine.stays_quiet("bestmove", Duration::from_millis(1500)), "answered while pondering");
+    engine.send("ponderhit");
+    let started = Instant::now();
+    engine.wait_for("bestmove", Duration::from_secs(5));
+    // our budget for a 10 s clock is well under 2 s once the clock starts
+    assert!(started.elapsed() < Duration::from_secs(2), "took {:?} after ponderhit", started.elapsed());
+}
+
+#[test]
+fn stop_ends_pondering_with_a_move() {
+    let mut engine = Engine::start();
+    engine.send("position startpos moves d2d4");
+    engine.send("go ponder wtime 60000 btime 60000");
+    assert!(engine.stays_quiet("bestmove", Duration::from_millis(300)));
+    engine.send("stop");
+    engine.wait_for("bestmove", Duration::from_secs(2));
+}
+
+#[test]
+fn a_finished_ponder_search_still_waits_for_the_opponent() {
+    // only one legal move: the search ends at once, but the answer must wait for ponderhit
+    let mut engine = Engine::start();
+    engine.send("position fen 7k/8/8/8/8/8/1r6/K1r5 w - - 0 1");
+    engine.send("go ponder wtime 60000 btime 60000");
+    assert!(engine.stays_quiet("bestmove", Duration::from_millis(500)));
+    engine.send("ponderhit");
+    engine.wait_for("bestmove", Duration::from_secs(2));
 }

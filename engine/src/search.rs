@@ -5,7 +5,7 @@
 //! history move ordering, SEE-ordered captures and a quiescence search.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use shakmaty::zobrist::Zobrist64;
@@ -29,6 +29,44 @@ const GOOD_CAPTURE_SCORE: i32 = 200_000;
 const PROMOTION_SCORE: i32 = 150_000;
 const KILLER_SCORES: [i32; 2] = [90_000, 80_000];
 const BAD_CAPTURE_SCORE: i32 = -50_000;
+
+/// A search running on the opponent's time. Its clock starts at `hit` (the opponent
+/// played the predicted move); until then it never runs out of time.
+#[derive(Debug)]
+pub struct Ponder {
+    active: AtomicBool,
+    clock_start: Mutex<Instant>,
+}
+
+impl Ponder {
+    pub fn new() -> Ponder {
+        Ponder { active: AtomicBool::new(true), clock_start: Mutex::new(Instant::now()) }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// The opponent played the expected move: start our clock now.
+    pub fn hit(&self) {
+        *self.clock_start.lock().unwrap() = Instant::now();
+        self.active.store(false, Ordering::Release);
+    }
+
+    /// Time used on our own clock, `None` while still pondering.
+    fn clock_elapsed(&self) -> Option<Duration> {
+        if self.is_active() {
+            return None;
+        }
+        Some(self.clock_start.lock().unwrap().elapsed())
+    }
+}
+
+impl Default for Ponder {
+    fn default() -> Self {
+        Ponder::new()
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Limits {
@@ -181,6 +219,8 @@ pub fn format_score(score: i32) -> String {
 pub struct Searcher {
     pub tt: Tt,
     pub print_info: bool,
+    /// Set while searching on the opponent's time.
+    pub ponder: Option<Arc<Ponder>>,
     stop: Arc<AtomicBool>,
     nodes: u64,
     start: Instant,
@@ -215,6 +255,7 @@ impl Searcher {
             root_best: None,
             lmr: lmr_table(),
             network: None,
+            ponder: None,
             accumulators: vec![Accumulator::default(); MAX_PLY + 1],
         }
     }
@@ -231,6 +272,14 @@ impl Searcher {
         if let Some(network) = &self.network {
             let (done, next) = self.accumulators.split_at_mut(ply + 1);
             network.update(&done[ply], parent.board(), child.board(), &mut next[0]);
+        }
+    }
+
+    /// Time spent on our own clock (zero while pondering).
+    fn clock_elapsed(&self) -> Duration {
+        match &self.ponder {
+            Some(ponder) => ponder.clock_elapsed().unwrap_or(Duration::ZERO),
+            None => self.start.elapsed(),
         }
     }
 
@@ -299,7 +348,7 @@ impl Searcher {
             }
             if let Some(soft) = self.limits.soft_time {
                 let scale = time_scale(depth, stable_iterations, score_drop);
-                if should_stop_iterating(self.start.elapsed(), soft, self.limits.hard_time, scale) {
+                if should_stop_iterating(self.clock_elapsed(), soft, self.limits.hard_time, scale) {
                     break; // the next iteration would not finish in time, or the move is settled
                 }
             }
@@ -351,7 +400,7 @@ impl Searcher {
         if !self.can_abort || !self.nodes.is_multiple_of(NODES_PER_CLOCK_CHECK) {
             return false;
         }
-        let out_of_time = self.limits.hard_time.is_some_and(|limit| self.start.elapsed() >= limit);
+        let out_of_time = self.limits.hard_time.is_some_and(|limit| self.clock_elapsed() >= limit);
         let out_of_nodes = self.limits.max_nodes.is_some_and(|limit| self.nodes >= limit);
         if out_of_time || out_of_nodes || self.stop.load(Ordering::Relaxed) {
             self.aborted = true;

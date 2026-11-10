@@ -13,7 +13,7 @@ use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Position};
 use crate::book::Book;
 use crate::eval;
 use crate::nnue;
-use crate::search::{position_key, Limits, SearchResult, Searcher};
+use crate::search::{position_key, Limits, Ponder, SearchResult, Searcher};
 use crate::swindle::{self, Settings, DEFAULT_OPPONENT_ELO, DEFAULT_TOLERANCE};
 
 pub const NAME: &str = "Illusion";
@@ -54,6 +54,8 @@ pub struct GoParams {
     pub winc: u64,
     pub binc: u64,
     pub moves_to_go: Option<u32>,
+    /// Searching on the opponent's time; the clock starts at `ponderhit`.
+    pub ponder: bool,
     pub movetime: Option<u64>,
     pub depth: Option<i32>,
     pub nodes: Option<u64>,
@@ -74,7 +76,8 @@ pub fn parse_go(tokens: &[&str]) -> GoParams {
             "movetime" => params.movetime = number(),
             "depth" => params.depth = number().map(|v| v as i32),
             "nodes" => params.nodes = number(),
-            "infinite" | "ponder" => params.infinite = true,
+            "infinite" => params.infinite = true,
+            "ponder" => params.ponder = true,
             _ => {}
         }
     }
@@ -136,6 +139,7 @@ pub struct Uci {
     use_book: bool,
     swindle: Option<Settings>,
     swindle_settings: Settings,
+    ponder: Option<Arc<Ponder>>,
 }
 
 impl Default for Uci {
@@ -160,6 +164,7 @@ impl Uci {
             use_book: true,
             swindle: None,
             swindle_settings: Settings::default(),
+            ponder: None,
         }
     }
 
@@ -174,6 +179,7 @@ impl Uci {
                 println!("option name Hash type spin default {DEFAULT_HASH_MB} min 1 max 4096");
                 println!("option name Move Overhead type spin default {DEFAULT_OVERHEAD_MS} min 0 max 5000");
                 println!("option name OwnBook type check default true");
+                println!("option name Ponder type check default false");
                 println!("option name EvalFile type string default <empty>");
                 println!("option name KingSafety type check default {}", eval::king_safety_enabled());
                 println!("option name EndgameRules type check default {}", eval::endgame_rules_enabled());
@@ -202,6 +208,11 @@ impl Uci {
             "setoption" => self.set_option(args),
             "go" => self.go(args),
             "stop" => self.stop.store(true, Ordering::Relaxed),
+            "ponderhit" => {
+                if let Some(ponder) = &self.ponder {
+                    ponder.hit();
+                }
+            }
             "d" => println!("{}", Fen::from_position(&self.pos, EnPassantMode::Legal)),
             "quit" => {
                 self.stop.store(true, Ordering::Relaxed);
@@ -253,7 +264,7 @@ impl Uci {
 
     /// A book move, if the book is on, this is a normal timed game search and the position is known.
     fn book_move(&self, params: &GoParams) -> Option<String> {
-        let analysing = params.infinite || params.depth.is_some() || params.nodes.is_some();
+        let analysing = params.infinite || params.ponder || params.depth.is_some() || params.nodes.is_some();
         if !self.use_book || analysing {
             return None;
         }
@@ -270,20 +281,35 @@ impl Uci {
             return;
         }
         let limits = limits_for(&params, self.pos.turn(), self.overhead_ms);
-        // trap mode only in real games: it needs a clock to split, and analysis wants the true best move
-        let swindle = self.swindle.filter(|_| limits.soft_time.is_some() && !params.infinite);
+        // trap mode only in real games on our own clock: it splits the clock, and analysis wants the true best move
+        let swindle = self.swindle.filter(|_| limits.soft_time.is_some() && !params.infinite && !params.ponder);
+        let ponder = params.ponder.then(|| Arc::new(Ponder::new()));
+        self.ponder = ponder.clone();
         let (pos, history) = (self.pos.clone(), self.history.clone());
-        let searcher = Arc::clone(&self.searcher);
+        let (searcher, stop) = (Arc::clone(&self.searcher), Arc::clone(&self.stop));
         self.stop.store(false, Ordering::Relaxed);
         let worker = std::thread::Builder::new().stack_size(SEARCH_STACK_BYTES).spawn(move || {
             let mut searcher = searcher.lock().unwrap();
-            let best = match swindle {
+            searcher.ponder = ponder.clone();
+            let (best, reply) = match swindle {
                 Some(settings) => search_with_traps(&mut searcher, &pos, &history, limits, settings),
-                None => searcher.search(&pos, &history, limits).best_move,
+                None => {
+                    let result = searcher.search(&pos, &history, limits);
+                    (result.best_move, result.pv.get(1).copied())
+                }
             };
-            match best {
-                Some(m) => println!("bestmove {}", m.to_uci(CastlingMode::Standard)),
-                None => println!("bestmove 0000"),
+            searcher.ponder = None;
+            // a pondering engine must not answer before the opponent has actually moved
+            if let Some(ponder) = &ponder {
+                while ponder.is_active() && !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            let uci = |m: shakmaty::Move| m.to_uci(CastlingMode::Standard).to_string();
+            match (best, reply) {
+                (Some(m), Some(r)) => println!("bestmove {} ponder {}", uci(m), uci(r)),
+                (Some(m), None) => println!("bestmove {}", uci(m)),
+                (None, _) => println!("bestmove 0000"),
             }
         });
         self.worker = worker.ok();
@@ -323,7 +349,7 @@ fn search_with_traps(
     history: &[u64],
     limits: Limits,
     settings: Settings,
-) -> Option<shakmaty::Move> {
+) -> (Option<shakmaty::Move>, Option<shakmaty::Move>) {
     let start = Instant::now();
     let soft = limits.soft_time.expect("trap mode needs a clock");
     let share = |d: Option<Duration>| d.map(|d| d.mul_f64(SEARCH_SHARE_WITH_SWINDLE));
@@ -334,7 +360,8 @@ fn search_with_traps(
     let choice = swindle::choose(searcher, pos, history, &main, settings, start + soft);
     searcher.print_info = printing;
 
-    let Some(choice) = choice else { return main.best_move };
+    let main_reply = main.pv.get(1).copied();
+    let Some(choice) = choice else { return (main.best_move, main_reply) };
     if Some(choice.mv) != main.best_move {
         let name = |m: shakmaty::Move| m.to_uci(CastlingMode::Standard).to_string();
         println!(
@@ -349,7 +376,8 @@ fn search_with_traps(
     if choice.brilliant {
         println!("info string brilliant move !!");
     }
-    Some(choice.mv)
+    let reply = if Some(choice.mv) == main.best_move { main_reply } else { None };
+    (Some(choice.mv), reply)
 }
 
 pub fn run() {
