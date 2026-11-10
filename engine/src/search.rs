@@ -13,6 +13,7 @@ use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Move, Position, Role};
 
 use crate::eval::{adjust_network_score, evaluate, is_pawn_ending, MATE, MATE_BOUND};
 use crate::nnue::{self, Accumulator, Network};
+use crate::style::{self, Style};
 use crate::see::{role_value, see};
 use crate::tt::{Bound, Tt};
 
@@ -221,6 +222,8 @@ pub struct Searcher {
     pub print_info: bool,
     /// Set while searching on the opponent's time.
     pub ponder: Option<Arc<Ponder>>,
+    /// Human mode: the playing style and the colour the engine plays.
+    pub style: Option<(Style, Color)>,
     stop: Arc<AtomicBool>,
     nodes: u64,
     start: Instant,
@@ -256,15 +259,24 @@ impl Searcher {
             lmr: lmr_table(),
             network: None,
             ponder: None,
+            style: None,
             accumulators: vec![Accumulator::default(); MAX_PLY + 1],
         }
     }
 
     fn static_eval(&self, pos: &Chess, ply: usize) -> i32 {
-        match &self.network {
+        let score = match &self.network {
             Some(network) => adjust_network_score(network.output(&self.accumulators[ply], pos.turn()), pos),
             None => evaluate(pos),
+        };
+        match self.style {
+            Some((style, me)) => style::adjust(pos, score, me, style),
+            None => score,
         }
+    }
+
+    fn draw_score(&self, pos: &Chess) -> i32 {
+        self.style.map_or(0, |(style, me)| style::draw_score(pos, me, style))
     }
 
     /// Bring the network inputs for `child` (one ply below `parent`) up to date.
@@ -434,7 +446,7 @@ impl Searcher {
         }
         if ply > 0 {
             if self.is_draw(pos) {
-                return 0;
+                return self.draw_score(pos);
             }
             alpha = alpha.max(-MATE + ply as i32);
             beta = beta.min(MATE - ply as i32 - 1);
@@ -492,7 +504,7 @@ impl Searcher {
 
         let mut moves = pos.legal_moves();
         if moves.is_empty() {
-            return if in_check { -MATE + ply as i32 } else { 0 };
+            return if in_check { -MATE + ply as i32 } else { self.draw_score(pos) };
         }
         let mut scores = [0i32; 256];
         for (i, &m) in moves.iter().enumerate() {

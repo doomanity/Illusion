@@ -14,7 +14,8 @@ use crate::book::Book;
 use crate::eval;
 use crate::nnue;
 use crate::search::{position_key, Limits, Ponder, SearchResult, Searcher};
-use crate::swindle::{self, Settings, DEFAULT_OPPONENT_ELO, DEFAULT_TOLERANCE};
+use crate::style::{Style, DEFAULT_AGGRESSION, DEFAULT_CONTEMPT, MAX_AGGRESSION, MAX_CONTEMPT};
+use crate::swindle::{self, Settings, DEFAULT_OPPONENT_ELO, DEFAULT_TOLERANCE, SACRIFICE_HUNT_BONUS};
 
 pub const NAME: &str = "Illusion";
 pub const DEFAULT_HASH_MB: usize = 64;
@@ -22,7 +23,7 @@ pub const DEFAULT_OVERHEAD_MS: u64 = 30;
 const SEARCH_STACK_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MOVES_TO_GO: u64 = 20;
 /// Share of the move's time the normal search gets when trap mode is on; the rest goes to traps.
-const SEARCH_SHARE_WITH_SWINDLE: f64 = 0.5;
+const SEARCH_SHARE_WITH_SWINDLE: f64 = 0.7;
 
 /// Cheap unpredictable number for picking among book moves (not for anything security related).
 fn random_u64() -> u64 {
@@ -140,6 +141,8 @@ pub struct Uci {
     swindle: Option<Settings>,
     swindle_settings: Settings,
     ponder: Option<Arc<Ponder>>,
+    human_mode: bool,
+    style: Style,
 }
 
 impl Default for Uci {
@@ -165,6 +168,8 @@ impl Uci {
             swindle: None,
             swindle_settings: Settings::default(),
             ponder: None,
+            human_mode: false,
+            style: Style::default(),
         }
     }
 
@@ -183,6 +188,9 @@ impl Uci {
                 println!("option name EvalFile type string default <empty>");
                 println!("option name KingSafety type check default {}", eval::king_safety_enabled());
                 println!("option name EndgameRules type check default {}", eval::endgame_rules_enabled());
+                println!("option name HumanMode type check default false");
+                println!("option name Aggression type spin default {DEFAULT_AGGRESSION} min 0 max {MAX_AGGRESSION}");
+                println!("option name Contempt type spin default {DEFAULT_CONTEMPT} min 0 max {MAX_CONTEMPT}");
                 println!("option name Swindle type check default false");
                 println!("option name OpponentElo type spin default {DEFAULT_OPPONENT_ELO} min 400 max 2800");
                 println!("option name SwindleTolerance type spin default {DEFAULT_TOLERANCE} min 0 max 300");
@@ -232,6 +240,21 @@ impl Uci {
         let on = value.eq_ignore_ascii_case("true");
         match name.as_str() {
             "ownbook" => self.use_book = on,
+            "humanmode" => {
+                self.wait_for_search();
+                self.human_mode = on;
+                self.searcher.lock().unwrap().new_game(); // old scores were made with the other style
+            }
+            "aggression" => {
+                if let Ok(n) = value.parse::<i32>() {
+                    self.style.aggression = n.clamp(0, MAX_AGGRESSION);
+                }
+            }
+            "contempt" => {
+                if let Ok(n) = value.parse::<i32>() {
+                    self.style.contempt = n.clamp(0, MAX_CONTEMPT);
+                }
+            }
             "kingsafety" => eval::set_king_safety(on),
             "evalfile" => {
                 self.wait_for_search();
@@ -282,7 +305,13 @@ impl Uci {
         }
         let limits = limits_for(&params, self.pos.turn(), self.overhead_ms);
         // trap mode only in real games on our own clock: it splits the clock, and analysis wants the true best move
-        let swindle = self.swindle.filter(|_| limits.soft_time.is_some() && !params.infinite && !params.ponder);
+        // human mode switches trap mode on too, with sacrifice hunting
+        let traps = match (self.swindle, self.human_mode) {
+            (_, true) => Some(Settings { sacrifice_bonus: SACRIFICE_HUNT_BONUS, ..self.swindle_settings }),
+            (swindle, false) => swindle,
+        };
+        let swindle = traps.filter(|_| limits.soft_time.is_some() && !params.infinite && !params.ponder);
+        let style = self.human_mode.then_some((self.style, self.pos.turn()));
         let ponder = params.ponder.then(|| Arc::new(Ponder::new()));
         self.ponder = ponder.clone();
         let (pos, history) = (self.pos.clone(), self.history.clone());
@@ -291,6 +320,7 @@ impl Uci {
         let worker = std::thread::Builder::new().stack_size(SEARCH_STACK_BYTES).spawn(move || {
             let mut searcher = searcher.lock().unwrap();
             searcher.ponder = ponder.clone();
+            searcher.style = style;
             let (best, reply) = match swindle {
                 Some(settings) => search_with_traps(&mut searcher, &pos, &history, limits, settings),
                 None => {
@@ -299,6 +329,7 @@ impl Uci {
                 }
             };
             searcher.ponder = None;
+            searcher.style = None;
             // a pondering engine must not answer before the opponent has actually moved
             if let Some(ponder) = &ponder {
                 while ponder.is_active() && !stop.load(Ordering::Relaxed) {
@@ -350,6 +381,10 @@ fn search_with_traps(
     limits: Limits,
     settings: Settings,
 ) -> (Option<shakmaty::Move>, Option<shakmaty::Move>) {
+    if swindle::effective_tolerance(settings) == 0 {
+        let result = searcher.search(pos, history, limits);
+        return (result.best_move, result.pv.get(1).copied()); // strong opponent: just play
+    }
     let start = Instant::now();
     let soft = limits.soft_time.expect("trap mode needs a clock");
     let share = |d: Option<Duration>| d.map(|d| d.mul_f64(SEARCH_SHARE_WITH_SWINDLE));

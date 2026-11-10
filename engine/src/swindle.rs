@@ -17,6 +17,11 @@ const ALREADY_WINNING: i32 = 400; // just convert, no need for tricks
 const MAX_CANDIDATES: usize = 6;
 const MIN_GAIN: f64 = 10.0; // a trap must beat the best move's expectation by this much
 const ROOT_NODES: u64 = 30_000;
+const VERIFY_NODES: u64 = 300_000;
+/// Against opponents this strong traps are not worth anything: no move may lose eval for one.
+const NO_TRAPS_FROM_ELO: i32 = 2600;
+/// Elo range over which the allowed trap cost grows from nothing to the full tolerance.
+const TOLERANCE_RAMP_ELO: i32 = 800;
 const REPLY_NODES: u64 = 8_000;
 
 const MIN_ELO_FOR_NOISE: f64 = 600.0;
@@ -31,17 +36,23 @@ const PROMOTION_BONUS: f64 = 1.0;
 const RECAPTURE_BONUS: f64 = 1.0;
 
 const BRILLIANT_MIN_SACRIFICE: i32 = 200;
+/// A move that gives up at least this much material (by exchange count) is a sacrifice.
+const SACRIFICE_MIN_LOSS: i32 = 100;
+/// Extra expected centipawns a sacrifice gets when sacrifice hunting is on.
+pub const SACRIFICE_HUNT_BONUS: i32 = 40;
 const BRILLIANT_MAX_BEFORE: i32 = 300;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
     pub opponent_elo: i32,
     pub tolerance: i32,
+    /// Bonus for sound sacrifices when choosing among safe moves (0 = off).
+    pub sacrifice_bonus: i32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { opponent_elo: DEFAULT_OPPONENT_ELO, tolerance: DEFAULT_TOLERANCE }
+        Settings { opponent_elo: DEFAULT_OPPONENT_ELO, tolerance: DEFAULT_TOLERANCE, sacrifice_bonus: 0 }
     }
 }
 
@@ -51,6 +62,13 @@ pub struct Choice {
     pub expected: f64,
     pub best_expected: f64,
     pub brilliant: bool,
+}
+
+/// How many centipawns a trap may cost against this opponent: the full tolerance against
+/// players 800 elo below `NO_TRAPS_FROM_ELO` or weaker, nothing against strong ones.
+pub fn effective_tolerance(settings: Settings) -> i32 {
+    let gap = (NO_TRAPS_FROM_ELO - settings.opponent_elo).clamp(0, TOLERANCE_RAMP_ELO);
+    settings.tolerance * gap / TOLERANCE_RAMP_ELO
 }
 
 /// How much a player's choice blurs between moves, in centipawns. Higher means weaker.
@@ -114,6 +132,13 @@ struct Explorer<'a> {
 }
 
 impl Explorer<'_> {
+    /// Deeper check that a trap move really keeps us above `floor` against best defence.
+    fn holds_up(&mut self, pos: &Chess, mv: Move, floor: i32, main_depth: i32) -> bool {
+        let child = pos.clone().play(mv).expect("legal move");
+        let depth = (main_depth - 2).max(4);
+        -probe(self.searcher, &child, &self.history, depth, VERIFY_NODES) >= floor
+    }
+
     fn out_of_time(&self) -> bool {
         Instant::now() >= self.deadline || self.searcher.stopped()
     }
@@ -166,7 +191,11 @@ pub fn choose(
         reply_depth: (root_depth - 2).max(1),
     };
 
-    let floor = main.score - settings.tolerance;
+    let tolerance = effective_tolerance(settings);
+    if tolerance == 0 {
+        return None;
+    }
+    let floor = main.score - tolerance;
     let mut candidates = vec![(best, main.score)];
     for m in pos.legal_moves() {
         if m == best {
@@ -188,25 +217,34 @@ pub fn choose(
     }
 
     let elo = settings.opponent_elo;
+    // what each move is worth to us when choosing: expected score plus the sacrifice bonus
+    let appeal = |m: Move, expected: f64| {
+        let sacrifice = settings.sacrifice_bonus > 0 && see(pos.board(), m) <= -SACRIFICE_MIN_LOSS;
+        expected + if sacrifice { f64::from(settings.sacrifice_bonus) } else { 0.0 }
+    };
     let mut best_expected = None;
-    let mut chosen: Option<(Move, f64)> = None;
+    let mut chosen: Option<(Move, f64, f64)> = None; // move, expected, appeal
     for (m, _) in candidates {
         let child = pos.clone().play(m).expect("legal move");
         let Some((expected, worst)) = explorer.expectation(&child, m, elo) else { break };
+        let value = appeal(m, expected);
         if m == best {
-            best_expected = Some(expected);
-            chosen = Some((m, expected));
+            best_expected = Some((expected, value));
+            chosen = Some((m, expected, value));
             continue;
         }
         let safe = worst >= floor;
-        if safe && chosen.is_some_and(|(_, e)| expected > e) {
-            chosen = Some((m, expected));
+        if safe && chosen.is_some_and(|(_, _, v)| value > v) {
+            chosen = Some((m, expected, value));
         }
     }
 
-    let best_expected = best_expected?;
-    let (mv, expected) = chosen?;
-    if mv != best && expected < best_expected + MIN_GAIN {
+    let (best_expected, best_appeal) = best_expected?;
+    let (mv, expected, appeal_value) = chosen?;
+    if mv != best && appeal_value < best_appeal + MIN_GAIN {
+        return None;
+    }
+    if mv != best && !explorer.holds_up(pos, mv, floor, main.depth) {
         return None;
     }
     let sacrifice = see(pos.board(), mv) <= -BRILLIANT_MIN_SACRIFICE;

@@ -59,7 +59,7 @@ fn already_winning_means_no_tricks() {
 
 #[test]
 fn trap_moves_stay_close_to_the_best_move() {
-    let settings = Settings { opponent_elo: 1000, tolerance: 60 };
+    let settings = Settings { opponent_elo: 1000, tolerance: 60, ..Settings::default() };
     for fen in MIDDLEGAMES {
         let position = pos(fen);
         let mut s = searcher();

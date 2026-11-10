@@ -49,7 +49,7 @@ const ENEMY_KING_DISTANCE_WEIGHT: i32 = 5;
 const OWN_KING_DISTANCE_WEIGHT: i32 = 2;
 
 // King safety: how dangerous each piece type is when it hits squares around the enemy king.
-const KING_ATTACK_WEIGHT: [i32; 4] = [2, 2, 3, 5]; // knight, bishop, rook, queen
+pub(crate) const KING_ATTACK_WEIGHT: [i32; 4] = [2, 2, 3, 5]; // knight, bishop, rook, queen
 const KING_DANGER_DIVISOR: i32 = 3;
 const MAX_KING_DANGER: i32 = 400;
 const SHIELD_MISSING: i32 = 20;
@@ -268,7 +268,7 @@ fn distance_from_center(square: usize) -> i32 {
 }
 
 /// The king, the squares next to it and one more rank in front.
-fn king_zone(king: usize, is_white: bool) -> u64 {
+pub(crate) fn king_zone(king: usize, is_white: bool) -> u64 {
     let near = u64::from(attacks::king_attacks(shakmaty::Square::new(king as u32))) | (1u64 << king);
     let forward = if is_white { near << 8 } else { near >> 8 };
     near | forward

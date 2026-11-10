@@ -359,3 +359,23 @@ fn a_finished_ponder_search_still_waits_for_the_opponent() {
     engine.send("ponderhit");
     engine.wait_for("bestmove", Duration::from_secs(2));
 }
+
+#[test]
+fn human_mode_options_work_and_still_play_legal_moves_on_time() {
+    let fen = "r1b2rk1/pp1nqppp/2pbpn2/3p4/2PP4/2NBPN2/PPQ2PPP/R1B2RK1 w - - 4 9";
+    let mut engine = Engine::start();
+    engine.send("uci");
+    engine.wait_for("option name HumanMode type check default false", Duration::from_secs(5));
+    engine.wait_for("option name Aggression", Duration::from_secs(5));
+    engine.wait_for("option name Contempt", Duration::from_secs(5));
+    engine.send("setoption name HumanMode value true");
+    engine.send("setoption name Aggression value 100");
+    engine.send("setoption name OpponentElo value 1200");
+    engine.send(&format!("position fen {fen}"));
+    let started = Instant::now();
+    engine.send("go wtime 10000 btime 10000 winc 100 binc 100");
+    let line = engine.wait_for("bestmove", Duration::from_secs(5));
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let mv = line.split_whitespace().nth(1).unwrap();
+    assert!(is_legal_uci(&pos(fen), mv), "{mv}");
+}
