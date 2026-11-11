@@ -11,9 +11,10 @@ use shakmaty::uci::UciMove;
 use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Position};
 
 use crate::book::Book;
+use crate::brilliant::{self, DEFAULT_HUNT, MAX_HUNT};
 use crate::eval;
 use crate::nnue;
-use crate::search::{position_key, Limits, Ponder, SearchResult, Searcher};
+use crate::search::{format_score, position_key, Limits, Ponder, SearchResult, Searcher};
 use crate::style::{Style, DEFAULT_AGGRESSION, DEFAULT_CONTEMPT, MAX_AGGRESSION, MAX_CONTEMPT};
 use crate::swindle::{self, Settings, DEFAULT_OPPONENT_ELO, DEFAULT_TOLERANCE, SACRIFICE_HUNT_BONUS};
 
@@ -22,8 +23,9 @@ pub const DEFAULT_HASH_MB: usize = 64;
 pub const DEFAULT_OVERHEAD_MS: u64 = 30;
 const SEARCH_STACK_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MOVES_TO_GO: u64 = 20;
-/// Share of the move's time the normal search gets when trap mode is on; the rest goes to traps.
-const SEARCH_SHARE_WITH_SWINDLE: f64 = 0.7;
+/// Extra time for traps and sacrifice checks after the full normal search, as a share of
+/// the move's soft budget (they also use whatever the normal search left unused).
+const EXTRA_SHARE_FOR_TRAPS: f64 = 0.15;
 
 /// Cheap unpredictable number for picking among book moves (not for anything security related).
 fn random_u64() -> u64 {
@@ -143,6 +145,7 @@ pub struct Uci {
     ponder: Option<Arc<Ponder>>,
     human_mode: bool,
     style: Style,
+    brilliant_hunt: i32,
 }
 
 impl Default for Uci {
@@ -170,6 +173,7 @@ impl Uci {
             ponder: None,
             human_mode: false,
             style: Style::default(),
+            brilliant_hunt: DEFAULT_HUNT,
         }
     }
 
@@ -191,6 +195,7 @@ impl Uci {
                 println!("option name HumanMode type check default false");
                 println!("option name Aggression type spin default {DEFAULT_AGGRESSION} min 0 max {MAX_AGGRESSION}");
                 println!("option name Contempt type spin default {DEFAULT_CONTEMPT} min 0 max {MAX_CONTEMPT}");
+                println!("option name BrilliantHunt type spin default {DEFAULT_HUNT} min 0 max {MAX_HUNT}");
                 println!("option name Swindle type check default false");
                 println!("option name OpponentElo type spin default {DEFAULT_OPPONENT_ELO} min 400 max 2800");
                 println!("option name SwindleTolerance type spin default {DEFAULT_TOLERANCE} min 0 max 300");
@@ -248,6 +253,11 @@ impl Uci {
             "aggression" => {
                 if let Ok(n) = value.parse::<i32>() {
                     self.style.aggression = n.clamp(0, MAX_AGGRESSION);
+                }
+            }
+            "brillianthunt" => {
+                if let Ok(n) = value.parse::<i32>() {
+                    self.brilliant_hunt = n.clamp(0, MAX_HUNT);
                 }
             }
             "contempt" => {
@@ -310,7 +320,9 @@ impl Uci {
             (_, true) => Some(Settings { sacrifice_bonus: SACRIFICE_HUNT_BONUS, ..self.swindle_settings }),
             (swindle, false) => swindle,
         };
-        let swindle = traps.filter(|_| limits.soft_time.is_some() && !params.infinite && !params.ponder);
+        let on_clock = limits.soft_time.is_some() && !params.infinite && !params.ponder;
+        let swindle = traps.filter(|_| on_clock);
+        let hunt = if self.human_mode && on_clock { self.brilliant_hunt } else { 0 };
         let style = self.human_mode.then_some((self.style, self.pos.turn()));
         let ponder = params.ponder.then(|| Arc::new(Ponder::new()));
         self.ponder = ponder.clone();
@@ -321,12 +333,11 @@ impl Uci {
             let mut searcher = searcher.lock().unwrap();
             searcher.ponder = ponder.clone();
             searcher.style = style;
-            let (best, reply) = match swindle {
-                Some(settings) => search_with_traps(&mut searcher, &pos, &history, limits, settings),
-                None => {
-                    let result = searcher.search(&pos, &history, limits);
-                    (result.best_move, result.pv.get(1).copied())
-                }
+            let (best, reply) = if swindle.is_some() || hunt > 0 {
+                search_with_traps(&mut searcher, &pos, &history, limits, swindle, hunt)
+            } else {
+                let result = searcher.search(&pos, &history, limits);
+                (result.best_move, result.pv.get(1).copied())
             };
             searcher.ponder = None;
             searcher.style = None;
@@ -373,39 +384,62 @@ fn load_network(path: &str) {
     }
 }
 
-/// Normal search on part of the time, then spend the rest looking for a trap.
+/// Normal search on part of the time, then spend the rest looking for a sound sacrifice
+/// (`hunt` = how many centipawns it may cost) and a trap for the opponent.
 fn search_with_traps(
     searcher: &mut Searcher,
     pos: &Chess,
     history: &[u64],
     limits: Limits,
-    settings: Settings,
+    traps: Option<Settings>,
+    hunt: i32,
 ) -> (Option<shakmaty::Move>, Option<shakmaty::Move>) {
-    if swindle::effective_tolerance(settings) == 0 {
+    let traps = traps.filter(|&settings| swindle::effective_tolerance(settings) > 0);
+    if traps.is_none() && hunt == 0 {
         let result = searcher.search(pos, history, limits);
-        return (result.best_move, result.pv.get(1).copied()); // strong opponent: just play
+        return (result.best_move, result.pv.get(1).copied());
     }
     let start = Instant::now();
     let soft = limits.soft_time.expect("trap mode needs a clock");
-    let share = |d: Option<Duration>| d.map(|d| d.mul_f64(SEARCH_SHARE_WITH_SWINDLE));
-    let main_limits = Limits { soft_time: share(limits.soft_time), hard_time: share(limits.hard_time), ..limits };
-    let main: SearchResult = searcher.search(pos, history, main_limits);
+    // the normal search keeps its whole budget: cutting it costs a ply and far more elo than traps win
+    let main: SearchResult = searcher.search(pos, history, limits.clone());
+    let latest = start + limits.hard_time.unwrap_or(soft);
+    let deadline = (start + soft).max(Instant::now() + soft.mul_f64(EXTRA_SHARE_FOR_TRAPS)).min(latest);
+    let main_reply = main.pv.get(1).copied();
+    let name = |m: shakmaty::Move| m.to_uci(CastlingMode::Standard).to_string();
+
+    if main.best_move.is_some_and(|m| brilliant::is_sacrifice(pos, m)) {
+        println!("info string brilliant move !! (the best move is a sacrifice)");
+        return (main.best_move, main_reply);
+    }
 
     let printing = std::mem::replace(&mut searcher.print_info, false);
-    let choice = swindle::choose(searcher, pos, history, &main, settings, start + soft);
+    let sacrifice = brilliant::hunt(searcher, pos, history, &main, hunt, deadline);
+    let choice = match (sacrifice, traps) {
+        (None, Some(settings)) => swindle::choose(searcher, pos, history, &main, settings, deadline),
+        _ => None,
+    };
     searcher.print_info = printing;
 
-    let main_reply = main.pv.get(1).copied();
+    if let Some((mv, score)) = sacrifice {
+        println!(
+            "info string brilliant move !! sacrifice {} ({}) over {} ({})",
+            name(mv),
+            format_score(score),
+            main.best_move.map_or_else(String::new, name),
+            format_score(main.score)
+        );
+        return (Some(mv), None);
+    }
     let Some(choice) = choice else { return (main.best_move, main_reply) };
     if Some(choice.mv) != main.best_move {
-        let name = |m: shakmaty::Move| m.to_uci(CastlingMode::Standard).to_string();
         println!(
             "info string trap {} (expected {:+.0}) over {} (expected {:+.0}) vs elo {}",
             name(choice.mv),
             choice.expected,
             main.best_move.map_or_else(String::new, name),
             choice.best_expected,
-            settings.opponent_elo
+            traps.map_or(0, |s| s.opponent_elo)
         );
     }
     if choice.brilliant {

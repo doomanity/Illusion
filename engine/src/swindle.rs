@@ -136,7 +136,10 @@ impl Explorer<'_> {
     fn holds_up(&mut self, pos: &Chess, mv: Move, floor: i32, main_depth: i32) -> bool {
         let child = pos.clone().play(mv).expect("legal move");
         let depth = (main_depth - 2).max(4);
-        -probe(self.searcher, &child, &self.history, depth, VERIFY_NODES) >= floor
+        let time_left = self.deadline.saturating_duration_since(Instant::now());
+        let limits = Limits { max_depth: Some(depth), max_nodes: Some(VERIFY_NODES), hard_time: Some(time_left), ..Limits::default() };
+        let result = self.searcher.search(&child, &self.history, limits);
+        (result.depth >= depth || result.score.abs() >= MATE_BOUND) && -result.score >= floor
     }
 
     fn out_of_time(&self) -> bool {
