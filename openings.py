@@ -197,8 +197,11 @@ def main(argv: list[str] | None = None) -> None:
 
         if args.verify:
             with_book, plain = verify(tree, start, judge, opponent, config, args.verify, random.Random(args.seed))
-            print(f"after the opening, vs {args.opp_elo}s ({args.verify} samples): "
-                  f"repertoire {with_book:.0%}, plain engine moves {plain:.0%}, edge {with_book - plain:+.1%}")
+            result = (f"after the opening, vs {args.opp_elo}s ({args.verify} samples): "
+                      f"repertoire {with_book:.0%}, plain engine moves {plain:.0%}, edge {with_book - plain:+.1%}")
+            print(result)
+            with open(txt_path, "a", encoding="utf-8") as handle:
+                handle.write("\n" + result + "\n")
     finally:
         if args.stockfish:
             judge.close()
