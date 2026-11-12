@@ -1,0 +1,7 @@
+ILLUSION WHITE WEAPON
+you play White. expected score vs 1500s: 50%
+1 lines, 1 of your moves to learn
+
+LINES (most common first, % = how often humans end up here)
+
+1. [5%] 1.Nf3 Nf6

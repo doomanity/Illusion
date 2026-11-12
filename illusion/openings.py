@@ -54,6 +54,7 @@ class FinderConfig:
     trap_loss: int = 150  # a human reply that loses this much is a trap
     trap_probability: float = 0.10  # ...if humans play it at least this often
     judge_depth: int = 3  # only used by the built-in python engine; stockfish has its own depth
+    min_line: float = 0.0  # drop opponent lines humans reach less often than this (0 = keep all); keeps the repertoire short
 
 
 def win_chance(cp: float) -> float:
@@ -111,8 +112,8 @@ class OpeningFinder:
         board = (board or chess.Board()).copy()
         self.positions = 0
         if board.turn == self.config.side:
-            return self._ours(board, self.config.my_moves)
-        return self._theirs(board, self.config.my_moves)
+            return self._ours(board, self.config.my_moves, 1.0)
+        return self._theirs(board, self.config.my_moves, 1.0)
 
     # ---- helpers ----------------------------------------------------------
     def _our_cp(self, board: chess.Board) -> int:
@@ -159,7 +160,7 @@ class OpeningFinder:
         return dict(self.me.distribution(board)).get(move, 0.0)
 
     # ---- the tree ---------------------------------------------------------
-    def _ours(self, board: chess.Board, moves_left: int) -> Node:
+    def _ours(self, board: chess.Board, moves_left: int, reach: float) -> Node:
         if moves_left == 0 or board.is_game_over(claim_draw=True):
             return self._leaf(board)
         self._tick()
@@ -170,7 +171,7 @@ class OpeningFinder:
         for move, cp in self._candidates(board, ranked):
             novelty = 1.0 - self._human_probability(board, move)
             board.push(move)
-            child = self._theirs(board, moves_left)
+            child = self._theirs(board, moves_left, reach)
             board.pop()
             value = (1 - config.truth_weight) * child.value + config.truth_weight * win_chance(cp)
             pick = value + config.novelty_weight * novelty
@@ -180,7 +181,7 @@ class OpeningFinder:
         assert best is not None  # the game is not over, so there is a legal move
         return best
 
-    def _theirs(self, board: chess.Board, moves_left: int) -> Node:
+    def _theirs(self, board: chess.Board, moves_left: int, reach: float) -> Node:
         if board.is_game_over(claim_draw=True):
             return self._leaf(board)
         self._tick()
@@ -195,10 +196,12 @@ class OpeningFinder:
         for move, probability in self.opponent.distribution(board):
             if covered >= config.coverage or len(node.replies) >= config.max_replies:
                 break
+            if reach * probability < config.min_line:
+                break  # replies are sorted, so every later one is rarer still
             if move not in scores:  # the ranker skipped it, so score it on its own
                 scores[move] = self.judge.move_value(board, move, config.judge_depth)
             board.push(move)
-            child = self._ours(board, moves_left - 1)
+            child = self._ours(board, moves_left - 1, reach * probability)
             board.pop()
             node.replies.append(Reply(move, probability, max(0, their_best - scores[move]), child))
             node.value += probability * child.value
@@ -312,3 +315,109 @@ def _add_pgn(pgn: chess.pgn.GameNode, node: Node, config: FinderConfig, opp_elo:
             notes.append(f"TRAP, loses {reply.loss / 100:.1f}, only good answer was {best}")
         child.comment = ", ".join(notes)
         _add_pgn(child, reply.child, config, opp_elo)
+
+
+# ---- readable output --------------------------------------------------------
+@dataclass
+class Step:
+    move: chess.Move
+    ours: bool
+    probability: float = 1.0  # how often humans play it (their moves only)
+    trap: bool = False
+    loss: int = 0  # centipawns their move throws away
+    best: str = ""  # the only good answer, in SAN
+
+
+def walk_lines(node: Node, board: chess.Board, config: FinderConfig, steps: tuple = (), reach: float = 1.0):
+    """Yield (steps, reach) for every line in the tree. `reach` is how often humans get into it."""
+    if node.ours:
+        if node.move is None or node.child is None:
+            yield list(steps), reach
+            return
+        board.push(node.move)
+        yield from walk_lines(node.child, board, config, steps + (Step(node.move, True),), reach)
+        board.pop()
+        return
+    if not node.replies:
+        yield list(steps), reach
+        return
+    trap_ids = {id(r) for r in node.traps(config)}
+    best = board.san(node.best_reply) if node.best_reply else ""
+    for reply in node.replies:
+        step = Step(reply.move, False, reply.probability, id(reply) in trap_ids, reply.loss, best)
+        board.push(reply.move)
+        yield from walk_lines(reply.child, board, config, steps + (step,), reach * reply.probability)
+        board.pop()
+
+
+def _numbered(start: chess.Board, steps: list[Step], marks: bool = True) -> tuple[str, chess.Board]:
+    """'1.Nf3 d5 2.c4 dxc4?' style text for a line (the start line included) and the board it ends on."""
+    board = chess.Board()
+    tokens: list[str] = []
+    played = list(start.move_stack) + [step.move for step in steps]
+    flags = [False] * len(start.move_stack) + [step.trap and marks for step in steps]
+    for move, flagged in zip(played, flags):
+        san = board.san(move)
+        if board.turn == chess.WHITE:
+            tokens.append(f"{board.fullmove_number}.{san}")
+        else:
+            tokens.append(f"{board.fullmove_number}...{san}" if not tokens else san)
+        if flagged:
+            tokens[-1] += "?"
+        board.push(move)
+    return " ".join(tokens), board
+
+
+def cheat_sheet(tree: Node, start: chess.Board, config: FinderConfig, title: str, opp_elo: int) -> str:
+    """Plain text you can read on a phone: one line per row, most common first, traps marked."""
+    rows = sorted(walk_lines(tree, start.copy(), config), key=lambda row: -row[1])
+    side = "White" if config.side == chess.WHITE else "Black"
+    out = [
+        title.upper(),
+        f"you play {side}. expected score vs {opp_elo}s: {tree.value:.0%}",
+        f"{len(rows)} lines, {positions_to_learn(tree)} of your moves to learn",
+        "",
+        "LINES (most common first, % = how often humans end up here)",
+        "",
+    ]
+    traps: dict[tuple[str, chess.Move], Step] = {}
+    trap_text: dict[tuple[str, chess.Move], str] = {}
+    for number, (steps, reach) in enumerate(rows, start=1):
+        out.append(f"{number}. [{reach:.0%}] {_numbered(start, steps)[0]}")
+        for index, step in enumerate(steps):
+            if step.trap:
+                before, board = _numbered(start, steps[:index], marks=False)
+                key = (before, step.move)
+                traps[key] = step
+                trap_text[key] = board.san(step.move)
+    if traps:
+        out += ["", "TRAPS (the reply humans fall for)", ""]
+        for key, step in sorted(traps.items(), key=lambda item: -item[1].probability * item[1].loss):
+            out.append(f"after {key[0] or '(start)'}:")
+            out.append(f"  humans play {trap_text[key]}? {step.probability:.0%} of the time, it loses {step.loss / 100:.1f}")
+            out.append(f"  the only good move is {step.best}")
+            out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
+def study_pgn(tree: Node, start: chess.Board, config: FinderConfig, title: str, opp_elo: int) -> str:
+    """One short game per line (a lichess study chapter each), no nested brackets."""
+    rows = sorted(walk_lines(tree, start.copy(), config), key=lambda row: -row[1])
+    games = []
+    for number, (steps, reach) in enumerate(rows, start=1):
+        game = chess.pgn.Game()
+        game.headers["Event"] = f"{title} {number}"
+        game.headers["Round"] = str(number)
+        game.headers["White"] = "You" if config.side == chess.WHITE else f"Human {opp_elo}"
+        game.headers["Black"] = "You" if config.side == chess.BLACK else f"Human {opp_elo}"
+        game.comment = f"humans reach this line {reach:.0%} of the time"
+        node: chess.pgn.GameNode = game
+        for move in start.move_stack:
+            node = node.add_main_variation(move)
+        for step in steps:
+            node = node.add_main_variation(step.move)
+            if step.trap:
+                node.nags.add(chess.pgn.NAG_MISTAKE if step.loss < 300 else chess.pgn.NAG_BLUNDER)
+                node.comment = f"TRAP: {step.probability:.0%} play this, it loses {step.loss / 100:.1f}. only good move: {step.best}"
+        games.append(str(game))
+    return "\n\n".join(games) + "\n"

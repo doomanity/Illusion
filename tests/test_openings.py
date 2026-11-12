@@ -1,6 +1,8 @@
+import io
 import random
 
 import chess
+import chess.pgn
 
 import openings as cli
 from illusion import EloModel, Engine
@@ -8,6 +10,8 @@ from illusion.openings import (
     FinderConfig,
     OpeningFinder,
     book_text,
+    cheat_sheet,
+    study_pgn,
     collect_traps,
     lines,
     positions_to_learn,
@@ -42,6 +46,10 @@ class GambitJudge:
             return -self.value(board, depth)
         finally:
             board.pop()
+
+    def top_moves(self, board, count=40):
+        ranked = [(m, self.move_value(board, m, 0)) for m in board.legal_moves]
+        return sorted(ranked, key=lambda pair: -pair[1])[:count]
 
 
 class ScriptedHumans:
@@ -141,12 +149,49 @@ def test_memorise_count_and_lines_agree():
     assert positions_to_learn(tree) == 3  # first move plus one reply move per branch
 
 
-def test_verify_follows_the_book_and_counts_every_game(monkeypatch):
-    monkeypatch.setattr(cli, "VERIFY_PLIES", 8)
+def test_verify_compares_the_repertoire_with_plain_engine_moves():
     cfg = config()
     tree = OpeningFinder(GambitJudge(), ScriptedHumans(), cfg).find()
-    wins, draws, losses = cli.verify(tree, chess.Board(), Engine(1), EloModel(1200), cfg, 2, random.Random(0))
-    assert wins + draws + losses == 2
+    # the gambit wins 80% of the time against these humans, plain best (1.d4/other) just scores 50%
+    with_book, plain = cli.verify(tree, chess.Board(), GambitJudge(), ScriptedHumans(), cfg, 40, random.Random(0))
+    assert with_book > plain
+
+
+def test_cheat_sheet_is_plain_readable_text_with_the_trap():
+    cfg = config()
+    tree = OpeningFinder(GambitJudge(), ScriptedHumans(), cfg).find()
+    text = cheat_sheet(tree, chess.Board(), cfg, "Test Gambit", 1500)
+    lines = [l for l in text.splitlines() if l[:1].isdigit()]
+    assert "TEST GAMBIT" in text and lines and all("(" not in l for l in lines)  # no nested brackets
+    assert "1. [80%] 1.e4 e5?" in text
+    assert "after 1.e4:" in text and "humans play e5? 80%" in text and "the only good move is" in text
+
+
+def test_cheat_sheet_numbers_black_moves_after_a_start_line():
+    start = cli.start_board("1.e4")
+    cfg = config(side=chess.BLACK, max_replies=1)
+    tree = OpeningFinder(Engine(1), EloModel(1200), cfg).find(start)
+    text = cheat_sheet(tree, start, cfg, "Black", 1200)
+    line = next(l for l in text.splitlines() if l.startswith("1. ["))
+    assert "1.e4 " in line and " 1..." not in line  # black's first reply is written plainly
+
+
+def test_study_pgn_is_one_flat_game_per_line():
+    cfg = config()
+    tree = OpeningFinder(GambitJudge(), ScriptedHumans(), cfg).find()
+    text = study_pgn(tree, chess.Board(), cfg, "Test Gambit", 1500)
+    games = list(iter(lambda g=io.StringIO(text): chess.pgn.read_game(g), None))
+    assert len(games) == 2
+    assert all("(" not in str(g.mainline_moves()) for g in games)
+    assert "TRAP" in text and games[0].headers["Event"] == "Test Gambit 1"
+
+
+def test_min_line_drops_rare_opponent_lines():
+    everything = OpeningFinder(GambitJudge(), ScriptedHumans(), config()).find()
+    pruned = OpeningFinder(GambitJudge(), ScriptedHumans(), config(min_line=0.5)).find()
+    assert len(everything.child.replies) == 2
+    assert [r.move for r in pruned.child.replies] == [BLUNDER]  # the 20% reply is below the cut
+    assert abs(pruned.child.unexpanded - 0.2) < 1e-9
 
 
 def test_cli_flags_and_start_line():

@@ -10,8 +10,10 @@ The real thing (stockfish judges, maia3 plays the humans):
 Grow an opening you already like, e.g. keep 1.e4 and go deeper:
     python openings.py --side white --start "e4 c6 d4 d5" --my-moves 5 ...
 
-Outputs a PGN (drop it into a lichess study to drill it) and a book file the
-engine can load with `setoption name BookFile value <path>`.
+Outputs three files per side:
+  opening_<side>.txt  plain text cheat sheet: one line per row, traps marked (read this one)
+  opening_<side>.pgn  one short game per line, import into a lichess study (a chapter each)
+  book_<side>.txt     book file for the engine: `setoption name BookFile value <path>`
 """
 from __future__ import annotations
 
@@ -29,13 +31,10 @@ from illusion.openings import (
     Node,
     OpeningFinder,
     book_text,
-    collect_traps,
-    positions_to_learn,
-    to_pgn,
+    cheat_sheet,
+    study_pgn,
+    win_chance,
 )
-
-VERIFY_PLIES = 80  # verification games stop here and the engine decides the result
-VERIFY_DECISIVE = 300  # centipawns that count as a won position at the cut-off
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -58,9 +57,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--soundness", type=int, default=250, help="max centipawns worse than best you allow")
     parser.add_argument("--truth-weight", type=float, default=0.25, help="0 = pure swindle, 1 = pure engine")
     parser.add_argument("--novelty-weight", type=float, default=0.05, help="bonus for rare moves")
-    parser.add_argument("--verify", type=int, default=0, help="play this many test games after the search")
+    parser.add_argument("--min-line", type=float, default=0.0, help="skip opponent lines humans reach less often than this, e.g. 0.04")
+    parser.add_argument("--verify", type=int, default=0, help="play this many sample openings and compare with plain engine moves")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--pgn", default=None, help="output PGN (default: opening_<side>.pgn)")
+    parser.add_argument("--txt", default=None, help="output cheat sheet (default: opening_<side>.txt)")
     parser.add_argument("--book", default=None, help="output book file (default: book_<side>.txt)")
     return parser.parse_args(argv)
 
@@ -84,6 +85,7 @@ def build_config(args: argparse.Namespace) -> FinderConfig:
         soundness=args.soundness,
         truth_weight=args.truth_weight,
         novelty_weight=args.novelty_weight,
+        min_line=args.min_line,
         judge_depth=args.depth,
     )
 
@@ -133,29 +135,31 @@ def engine_move(judge, board: chess.Board, depth: int) -> chess.Move:
     return judge.search(board, depth).move
 
 
-def verify(tree: Node, start: chess.Board, judge, opponent, config: FinderConfig, games: int, rng: random.Random):
-    """Play test games: you follow the repertoire, then the engine plays on; the human model plays them."""
-    book = our_moves(tree, start.copy())
-    wins = draws = losses = 0
-    for _ in range(games):
-        board = start.copy()
-        while not board.is_game_over(claim_draw=True) and len(board.move_stack) < VERIFY_PLIES:
-            if board.turn == config.side:
-                move = book.get(board.epd()) or engine_move(judge, board, config.judge_depth)
-            else:
-                move = sample_move(opponent.distribution(board), rng)
-            board.push(move)
-        outcome = board.outcome(claim_draw=True)
-        if outcome is not None:
-            score = 0.5 if outcome.winner is None else float(outcome.winner == config.side)
+def play_opening(book, start: chess.Board, judge, opponent, config: FinderConfig, rng: random.Random) -> float:
+    """Play the opening part only: you follow `book` (then the engine's best move), the human model
+    answers. Returns your win chance at the end, judged by the engine."""
+    board = start.copy()
+    plies = 2 * config.my_moves - (1 if config.side == chess.BLACK else 0)
+    for _ in range(plies):
+        if board.is_game_over(claim_draw=True):
+            break
+        if board.turn == config.side:
+            move = book.get(board.epd()) or engine_move(judge, board, config.judge_depth)
         else:
-            cp = judge.value(board, config.judge_depth)
-            cp = cp if board.turn == config.side else -cp
-            score = 1.0 if cp >= VERIFY_DECISIVE else 0.0 if cp <= -VERIFY_DECISIVE else 0.5
-        wins += score == 1.0
-        draws += score == 0.5
-        losses += score == 0.0
-    return wins, draws, losses
+            dist = opponent.distribution(board)
+            move = sample_move(dist, rng) if dist else engine_move(judge, board, config.judge_depth)
+        board.push(move)
+    cp = judge.value(board, config.judge_depth)
+    return win_chance(cp if board.turn == config.side else -cp)
+
+
+def verify(tree: Node, start: chess.Board, judge, opponent, config: FinderConfig, games: int, rng: random.Random):
+    """(your score with the repertoire, your score with plain best moves), both over the same number of
+    sampled openings against the human model. The difference is what the repertoire really gives you."""
+    book = our_moves(tree, start.copy())
+    with_book = sum(play_opening(book, start, judge, opponent, config, rng) for _ in range(games)) / games
+    plain = sum(play_opening({}, start, judge, opponent, config, rng) for _ in range(games)) / games
+    return with_book, plain
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -164,6 +168,7 @@ def main(argv: list[str] | None = None) -> None:
     start = start_board(args.start)
     name = args.name or f"Illusion {args.side.title()} Weapon"
     pgn_path = args.pgn or f"opening_{args.side}.pgn"
+    txt_path = args.txt or f"opening_{args.side}.txt"
     book_path = args.book or f"book_{args.side}.txt"
 
     judge = build_judge(args)
@@ -180,25 +185,20 @@ def main(argv: list[str] | None = None) -> None:
         tree = finder.find(start)
         print(f"\r  searched {finder.positions} positions in {time.time() - began:.0f}s      ", file=sys.stderr)
 
-        print(f"\nexpected score vs {args.opp_elo}s: {tree.value:.0%}")
-        print(f"moves to memorise: {positions_to_learn(tree)}")
-        traps = list(collect_traps(tree, start.copy(), config))
-        print(f"traps found: {len(traps)}")
-        for board, reply, best in sorted(traps, key=lambda t: -t[1].probability * t[1].loss)[:10]:
-            line = chess.Board().variation_san(board.move_stack) if board.move_stack else "(start)"
-            fix = board.san(best) if best else "?"
-            print(f"  {line} ... {board.san(reply.move)}? played {reply.probability:.0%}, "
-                  f"loses {reply.loss / 100:.1f} (only good move: {fix})")
-
+        sheet = cheat_sheet(tree, start, config, name, args.opp_elo)
+        print("\n" + sheet)
+        with open(txt_path, "w", encoding="utf-8") as handle:
+            handle.write(sheet)
         with open(pgn_path, "w", encoding="utf-8") as handle:
-            print(to_pgn(tree, start, config, name, args.opp_elo), file=handle)
+            handle.write(study_pgn(tree, start, config, name, args.opp_elo))
         with open(book_path, "w", encoding="utf-8") as handle:
             handle.write(book_text(tree, start, config, name))
-        print(f"\nsaved {pgn_path} (open in a lichess study) and {book_path} (engine BookFile)")
+        print(f"saved {txt_path} (read it), {pgn_path} (lichess study) and {book_path} (engine BookFile)")
 
         if args.verify:
-            wins, draws, losses = verify(tree, start, judge, opponent, config, args.verify, random.Random(args.seed))
-            print(f"test games vs {args.opp_elo}s: +{wins} ={draws} -{losses}")
+            with_book, plain = verify(tree, start, judge, opponent, config, args.verify, random.Random(args.seed))
+            print(f"after the opening, vs {args.opp_elo}s ({args.verify} samples): "
+                  f"repertoire {with_book:.0%}, plain engine moves {plain:.0%}, edge {with_book - plain:+.1%}")
     finally:
         if args.stockfish:
             judge.close()
