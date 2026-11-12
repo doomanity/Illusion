@@ -94,3 +94,24 @@ fn hard_limit_caps_an_extended_budget() {
     let hard = Some(Duration::from_millis(1200));
     assert!(should_stop_iterating(Duration::from_millis(720), soft, hard, 1.5));
 }
+
+#[test]
+fn pass_through_moves_are_walked_but_never_played() {
+    // a generated repertoire: we play 1.e4 and 2.Qh5, the human's 1...e5 is never a book move
+    let book = Book::parse("e4 ~e5 Qh5\ne4 ~c5 Nf3\n").unwrap();
+    assert_eq!(book.positions(), 3);
+    let after_e4 = pos("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1");
+    assert!(book.probe(&after_e4, 1).is_none());
+    let after_e5 = pos("rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2");
+    let mv = book.probe(&after_e5, 1).unwrap();
+    assert_eq!(mv.to_uci(CastlingMode::Standard).to_string(), "d1h5");
+}
+
+#[test]
+fn load_reads_a_file_and_reports_missing_ones() {
+    let path = std::env::temp_dir().join(format!("illusion_book_{}.txt", std::process::id()));
+    std::fs::write(&path, "# test\ne4 ~e5 Nf3\n").unwrap();
+    assert_eq!(Book::load(&path).unwrap().positions(), 2);
+    std::fs::remove_file(&path).unwrap();
+    assert!(Book::load(&path).is_err());
+}

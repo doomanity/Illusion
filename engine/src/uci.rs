@@ -188,6 +188,7 @@ impl Uci {
                 println!("option name Hash type spin default {DEFAULT_HASH_MB} min 1 max 4096");
                 println!("option name Move Overhead type spin default {DEFAULT_OVERHEAD_MS} min 0 max 5000");
                 println!("option name OwnBook type check default true");
+                println!("option name BookFile type string default <empty>");
                 println!("option name Ponder type check default false");
                 println!("option name EvalFile type string default <empty>");
                 println!("option name KingSafety type check default {}", eval::king_safety_enabled());
@@ -245,6 +246,7 @@ impl Uci {
         let on = value.eq_ignore_ascii_case("true");
         match name.as_str() {
             "ownbook" => self.use_book = on,
+            "bookfile" => self.load_book(&value),
             "humanmode" => {
                 self.wait_for_search();
                 self.human_mode = on;
@@ -292,6 +294,22 @@ impl Uci {
             }
             ("move overhead", Ok(ms)) => self.overhead_ms = ms as u64,
             _ => {}
+        }
+    }
+
+    /// Swap in a book file (empty = back to the built-in book). A broken file keeps the old book.
+    fn load_book(&mut self, path: &str) {
+        let path = path.trim();
+        if path.is_empty() || path == "<empty>" {
+            self.book = Book::built_in();
+            return;
+        }
+        match Book::load(std::path::Path::new(path)) {
+            Ok(book) => {
+                println!("info string loaded book {path} ({} positions)", book.positions());
+                self.book = book;
+            }
+            Err(message) => println!("info string {message}"),
         }
     }
 

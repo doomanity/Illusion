@@ -380,3 +380,18 @@ fn human_mode_options_work_and_still_play_legal_moves_on_time() {
     let mv = line.split_whitespace().nth(1).unwrap();
     assert!(is_legal_uci(&pos(fen), mv), "{mv}");
 }
+
+#[test]
+fn book_file_option_swaps_the_opening_book() {
+    let path = std::env::temp_dir().join(format!("illusion_uci_book_{}.txt", std::process::id()));
+    std::fs::write(&path, "h4 ~e5 a4\n").unwrap();
+    let mut engine = Engine::start();
+    engine.send(&format!("setoption name BookFile value {}", path.display()));
+    engine.wait_for("info string loaded book", WAIT);
+    engine.send("position startpos");
+    engine.send("go wtime 60000 btime 60000");
+    assert_eq!(engine.wait_for("bestmove", WAIT), "bestmove h2h4");
+    engine.send("setoption name BookFile value nowhere/missing.txt");
+    engine.wait_for("info string cannot read", WAIT);
+    std::fs::remove_file(&path).unwrap();
+}

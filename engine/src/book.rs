@@ -16,7 +16,9 @@ pub struct Book {
 
 impl Book {
     /// Parse book text: one line of SAN moves per variation, `#` starts a comment line.
-    /// Move numbers such as `1.` are ignored.
+    /// Move numbers such as `1.` are ignored. A move written as `~Nf6` is walked through
+    /// but never played from the book (an opponent move in a generated repertoire, which
+    /// may well be a blunder we only want to punish).
     pub fn parse(text: &str) -> Result<Book, String> {
         let mut moves: HashMap<u64, Vec<Move>> = HashMap::new();
         for (index, line) in text.lines().enumerate() {
@@ -30,13 +32,25 @@ impl Book {
                     continue;
                 }
                 let error = |why: String| format!("book line {}: '{token}': {why}", index + 1);
-                let san = San::from_ascii(token.as_bytes()).map_err(|e| error(e.to_string()))?;
+                let (pass_through, san_text) = match token.strip_prefix('~') {
+                    Some(rest) => (true, rest),
+                    None => (false, token),
+                };
+                let san = San::from_ascii(san_text.as_bytes()).map_err(|e| error(e.to_string()))?;
                 let mv = san.to_move(&pos).map_err(|e| error(e.to_string()))?;
-                moves.entry(position_key(&pos)).or_default().push(mv);
+                if !pass_through {
+                    moves.entry(position_key(&pos)).or_default().push(mv);
+                }
                 pos.play_unchecked(mv);
             }
         }
         Ok(Book { moves })
+    }
+
+    /// Load a book file, e.g. one written by `openings.py`.
+    pub fn load(path: &std::path::Path) -> Result<Book, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        Book::parse(&text)
     }
 
     pub fn built_in() -> Book {

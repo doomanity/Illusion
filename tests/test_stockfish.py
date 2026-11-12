@@ -137,3 +137,31 @@ def test_rust_engine_works_as_the_judge():
         mate_in_two = chess.Board("k7/8/8/1K6/8/8/8/7R w - - 0 1")
         assert judge.move_value(mate_in_two, chess.Move.from_uci("b5b6")) > MATE - 1000
         assert abs(judge.value(chess.Board())) < 100
+
+
+class FakeMultiPv:
+    """Answers a multipv search with three moves (white's view), in a scrambled order."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def analyse(self, board, limit, multipv=1):
+        self.calls += 1
+        rows = [("g1f3", 10), ("e2e4", 35), ("d2d4", 30)][:multipv]
+        return [
+            {"pv": [chess.Move.from_uci(uci)], "score": chess.engine.PovScore(chess.engine.Cp(cp), chess.WHITE)}
+            for uci, cp in rows
+        ]
+
+    def quit(self):
+        pass
+
+
+def test_top_moves_are_sorted_best_first_and_cached():
+    fake = FakeMultiPv()
+    engine = StockfishEngine(fake)
+    ranked = engine.top_moves(chess.Board(), 3)
+    assert [m.uci() for m, _ in ranked] == ["e2e4", "d2d4", "g1f3"]
+    assert ranked[0][1] == 35
+    engine.top_moves(chess.Board(), 3)
+    assert fake.calls == 1

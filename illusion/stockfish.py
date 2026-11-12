@@ -8,6 +8,7 @@ from .search import MATE
 
 DEFAULT_DEPTH = 12
 MAX_CACHED_POSITIONS = 50_000
+DEFAULT_TOP_MOVES = 12
 
 
 class StockfishEngine:
@@ -22,6 +23,7 @@ class StockfishEngine:
         self._engine = uci_engine
         self._limit = chess.engine.Limit(depth=depth)
         self._cache: dict[str, int] = {}
+        self._ranked: dict[str, list[tuple[chess.Move, int]]] = {}
 
     @classmethod
     def from_path(
@@ -49,6 +51,19 @@ class StockfishEngine:
             info = self._engine.analyse(board, self._limit)
             self._cache[key] = info["score"].pov(board.turn).score(mate_score=MATE)
         return self._cache[key]
+
+    def top_moves(self, board: chess.Board, count: int = DEFAULT_TOP_MOVES) -> list[tuple[chess.Move, int]]:
+        """The engine's `count` best moves with their scores (mover's view), best first.
+        One multipv search instead of one search per move."""
+        key = f"{board.fen()}|{count}"
+        if key not in self._ranked:
+            if len(self._ranked) >= MAX_CACHED_POSITIONS:
+                self._ranked.clear()
+            infos = self._engine.analyse(board, self._limit, multipv=count)
+            ranked = [(info["pv"][0], info["score"].pov(board.turn).score(mate_score=MATE)) for info in infos if info.get("pv")]
+            ranked.sort(key=lambda pair: -pair[1])
+            self._ranked[key] = ranked
+        return list(self._ranked[key])
 
     def move_value(self, board: chess.Board, move: chess.Move, depth: int | None = None) -> int:
         """Score of playing `move`, from the mover's view."""
