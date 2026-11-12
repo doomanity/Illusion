@@ -369,6 +369,7 @@ fn human_mode_options_work_and_still_play_legal_moves_on_time() {
     engine.wait_for("option name Aggression", Duration::from_secs(5));
     engine.wait_for("option name Contempt", Duration::from_secs(5));
     engine.wait_for("option name BrilliantHunt type spin default 30", Duration::from_secs(5));
+    engine.wait_for("option name Anglerfish type check default true", Duration::from_secs(5));
     engine.send("setoption name HumanMode value true");
     engine.send("setoption name Aggression value 100");
     engine.send("setoption name OpponentElo value 1200");

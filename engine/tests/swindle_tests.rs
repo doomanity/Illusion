@@ -83,3 +83,30 @@ fn trap_search_respects_its_deadline() {
     let _ = choose(&mut s, &position, &[], &main, Settings::default(), started + Duration::from_millis(100));
     assert!(started.elapsed() < Duration::from_millis(400));
 }
+
+#[test]
+fn weaker_players_look_less_deep() {
+    use illusion_engine::swindle::perception_depth;
+    assert!(perception_depth(1000) < perception_depth(1500));
+    assert!(perception_depth(1500) < perception_depth(2000));
+    assert!(perception_depth(2000) <= perception_depth(2600));
+    assert!(perception_depth(800) >= 1);
+}
+
+#[test]
+fn anglerfish_baits_stay_safe_against_best_defence() {
+    let settings = Settings { opponent_elo: 1100, tolerance: 60, anglerfish: true, ..Settings::default() };
+    for fen in MIDDLEGAMES {
+        let position = pos(fen);
+        let mut s = searcher();
+        let main = s.search(&position, &[], Limits::depth(9));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let Some(choice) = choose(&mut s, &position, &[], &main, settings, deadline) else { continue };
+        let after = position.clone().play(choice.mv).unwrap();
+        if let Some(bait) = choice.bait {
+            assert!(after.legal_moves().contains(&bait), "bait must be a legal reply");
+        }
+        let score = -s.search(&after, &[], Limits::depth(9)).score;
+        assert!(score >= main.score - settings.tolerance - 40, "{fen}: {score} vs best {}", main.score);
+    }
+}

@@ -32,12 +32,12 @@ fn ordinary_moves_and_fair_trades_are_not_sacrifices() {
 }
 
 #[test]
-fn hunting_off_finds_nothing() {
+fn negative_room_turns_hunting_off() {
     let position = pos("r4rk1/1bqnbppp/p2ppn2/1p6/3NP3/1BN1BP2/PPPQ2PP/2KR3R w - - 0 12");
     let mut searcher = Searcher::new(16, Arc::new(AtomicBool::new(false)));
     let main = searcher.search(&position, &[], Limits::depth(8));
     let deadline = Instant::now() + Duration::from_secs(5);
-    assert!(hunt(&mut searcher, &position, &[], &main, 0, deadline).is_none());
+    assert!(hunt(&mut searcher, &position, &[], &main, -1, deadline).is_none());
 }
 
 #[test]

@@ -25,7 +25,7 @@ const SEARCH_STACK_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MOVES_TO_GO: u64 = 20;
 /// Extra time for traps and sacrifice checks after the full normal search, as a share of
 /// the move's soft budget (they also use whatever the normal search left unused).
-const EXTRA_SHARE_FOR_TRAPS: f64 = 0.15;
+const EXTRA_SHARE_FOR_TRAPS: f64 = 0.3;
 
 /// Cheap unpredictable number for picking among book moves (not for anything security related).
 fn random_u64() -> u64 {
@@ -146,6 +146,7 @@ pub struct Uci {
     human_mode: bool,
     style: Style,
     brilliant_hunt: i32,
+    anglerfish: bool,
 }
 
 impl Default for Uci {
@@ -174,6 +175,7 @@ impl Uci {
             human_mode: false,
             style: Style::default(),
             brilliant_hunt: DEFAULT_HUNT,
+            anglerfish: true,
         }
     }
 
@@ -197,6 +199,7 @@ impl Uci {
                 println!("option name Aggression type spin default {DEFAULT_AGGRESSION} min 0 max {MAX_AGGRESSION}");
                 println!("option name Contempt type spin default {DEFAULT_CONTEMPT} min 0 max {MAX_CONTEMPT}");
                 println!("option name BrilliantHunt type spin default {DEFAULT_HUNT} min 0 max {MAX_HUNT}");
+                println!("option name Anglerfish type check default true");
                 println!("option name Swindle type check default false");
                 println!("option name OpponentElo type spin default {DEFAULT_OPPONENT_ELO} min 400 max 2800");
                 println!("option name SwindleTolerance type spin default {DEFAULT_TOLERANCE} min 0 max 300");
@@ -257,6 +260,7 @@ impl Uci {
                     self.style.aggression = n.clamp(0, MAX_AGGRESSION);
                 }
             }
+            "anglerfish" => self.anglerfish = on,
             "brillianthunt" => {
                 if let Ok(n) = value.parse::<i32>() {
                     self.brilliant_hunt = n.clamp(0, MAX_HUNT);
@@ -334,13 +338,16 @@ impl Uci {
         let limits = limits_for(&params, self.pos.turn(), self.overhead_ms);
         // trap mode only in real games on our own clock: it splits the clock, and analysis wants the true best move
         // human mode switches trap mode on too, with sacrifice hunting
+        let anglerfish = self.anglerfish;
         let traps = match (self.swindle, self.human_mode) {
-            (_, true) => Some(Settings { sacrifice_bonus: SACRIFICE_HUNT_BONUS, ..self.swindle_settings }),
-            (swindle, false) => swindle,
+            (_, true) => Some(Settings { sacrifice_bonus: SACRIFICE_HUNT_BONUS, anglerfish, ..self.swindle_settings }),
+            (swindle, false) => swindle.map(|s| Settings { anglerfish, ..s }),
         };
         let on_clock = limits.soft_time.is_some() && !params.infinite && !params.ponder;
         let swindle = traps.filter(|_| on_clock);
-        let hunt = if self.human_mode && on_clock { self.brilliant_hunt } else { 0 };
+        // like traps, sacrifices get less room against stronger opponents (only mates at 2600+)
+        let room = Settings { tolerance: self.brilliant_hunt, ..self.swindle_settings };
+        let hunt = (self.human_mode && on_clock && self.brilliant_hunt > 0).then(|| swindle::effective_tolerance(room));
         let style = self.human_mode.then_some((self.style, self.pos.turn()));
         let ponder = params.ponder.then(|| Arc::new(Ponder::new()));
         self.ponder = ponder.clone();
@@ -351,7 +358,7 @@ impl Uci {
             let mut searcher = searcher.lock().unwrap();
             searcher.ponder = ponder.clone();
             searcher.style = style;
-            let (best, reply) = if swindle.is_some() || hunt > 0 {
+            let (best, reply) = if swindle.is_some() || hunt.is_some() {
                 search_with_traps(&mut searcher, &pos, &history, limits, swindle, hunt)
             } else {
                 let result = searcher.search(&pos, &history, limits);
@@ -403,17 +410,17 @@ fn load_network(path: &str) {
 }
 
 /// Normal search on part of the time, then spend the rest looking for a sound sacrifice
-/// (`hunt` = how many centipawns it may cost) and a trap for the opponent.
+/// (`hunt` = how many centipawns it may cost, `None` = off) and a trap for the opponent.
 fn search_with_traps(
     searcher: &mut Searcher,
     pos: &Chess,
     history: &[u64],
     limits: Limits,
     traps: Option<Settings>,
-    hunt: i32,
+    hunt: Option<i32>,
 ) -> (Option<shakmaty::Move>, Option<shakmaty::Move>) {
     let traps = traps.filter(|&settings| swindle::effective_tolerance(settings) > 0);
-    if traps.is_none() && hunt == 0 {
+    if traps.is_none() && hunt.is_none() {
         let result = searcher.search(pos, history, limits);
         return (result.best_move, result.pv.get(1).copied());
     }
@@ -432,7 +439,7 @@ fn search_with_traps(
     }
 
     let printing = std::mem::replace(&mut searcher.print_info, false);
-    let sacrifice = brilliant::hunt(searcher, pos, history, &main, hunt, deadline);
+    let sacrifice = hunt.and_then(|max_loss| brilliant::hunt(searcher, pos, history, &main, max_loss, deadline));
     let choice = match (sacrifice, traps) {
         (None, Some(settings)) => swindle::choose(searcher, pos, history, &main, settings, deadline),
         _ => None,
@@ -459,6 +466,9 @@ fn search_with_traps(
             choice.best_expected,
             traps.map_or(0, |s| s.opponent_elo)
         );
+    }
+    if let (true, Some(reply)) = (Some(choice.mv) != main.best_move, choice.bait) {
+        println!("info string anglerfish bait {}: {} looks good for them but loses", name(choice.mv), name(reply));
     }
     if choice.brilliant {
         println!("info string brilliant move !!");

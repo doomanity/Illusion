@@ -9,6 +9,7 @@ use shakmaty::{Chess, Move, Position};
 use crate::eval::MATE_BOUND;
 use crate::search::{position_key, Limits, SearchResult, Searcher};
 use crate::see::see;
+use crate::swindle::MAX_VERIFY_DEPTH;
 
 pub const DEFAULT_HUNT: i32 = 30;
 pub const MAX_HUNT: i32 = 100;
@@ -16,7 +17,6 @@ pub const MAX_HUNT: i32 = 100;
 /// A move that gives up at least this much material by exchange is a sacrifice.
 pub const SACRIFICE_MIN_LOSS: i32 = 100;
 const QUICK_NODES: u64 = 20_000;
-const VERIFY_NODES: u64 = 1_500_000;
 const VERIFY_AT_MOST: usize = 3;
 /// Quick checks are rough, so let sacrifices this much below the limit through to verification.
 const QUICK_SLACK: i32 = 80;
@@ -27,9 +27,9 @@ pub fn is_sacrifice(pos: &Chess, m: Move) -> bool {
 
 /// Score of `pos` for the side to move, searched quietly within a node budget, and the
 /// depth that was actually completed.
-fn score(searcher: &mut Searcher, pos: &Chess, history: &[u64], depth: i32, nodes: u64, deadline: Instant) -> (i32, i32) {
+fn score(searcher: &mut Searcher, pos: &Chess, history: &[u64], depth: i32, nodes: Option<u64>, deadline: Instant) -> (i32, i32) {
     let time_left = deadline.saturating_duration_since(Instant::now());
-    let limits = Limits { max_depth: Some(depth), max_nodes: Some(nodes), hard_time: Some(time_left), ..Limits::default() };
+    let limits = Limits { max_depth: Some(depth), max_nodes: nodes, hard_time: Some(time_left), ..Limits::default() };
     let result = searcher.search(pos, history, limits);
     (result.score, result.depth)
 }
@@ -50,7 +50,7 @@ pub fn hunt(
     deadline: Instant,
 ) -> Option<(Move, i32)> {
     let best = main.best_move?;
-    if max_loss <= 0 || main.score <= -MATE_BOUND || is_sacrifice(pos, best) {
+    if max_loss < 0 || main.score <= -MATE_BOUND || is_sacrifice(pos, best) {
         return None; // off, already lost, or the best move is a sacrifice anyway
     }
     let history: Vec<u64> = history.iter().copied().chain([position_key(pos)]).collect();
@@ -66,21 +66,21 @@ pub fn hunt(
             return None;
         }
         let child = pos.clone().play(m).expect("legal move");
-        let quick = -score(searcher, &child, &history, quick_depth, QUICK_NODES, deadline).0;
+        let quick = -score(searcher, &child, &history, quick_depth, Some(QUICK_NODES), deadline).0;
         if acceptable(quick, main.score, max_loss + QUICK_SLACK) {
             promising.push((m, quick));
         }
     }
     promising.sort_by_key(|&(_, quick)| -quick);
 
-    let verify_depth = (main.depth - 2).max(4);
+    let verify_depth = (main.depth - 1).clamp(4, MAX_VERIFY_DEPTH); // as deep as the main search looked
     let mut found: Option<(Move, i32)> = None;
     for (m, _) in promising.into_iter().take(VERIFY_AT_MOST) {
         if out_of_time(searcher) {
             break;
         }
         let child = pos.clone().play(m).expect("legal move");
-        let (child_score, completed) = score(searcher, &child, &history, verify_depth, VERIFY_NODES, deadline);
+        let (child_score, completed) = score(searcher, &child, &history, verify_depth, None, deadline);
         if completed < verify_depth && child_score.abs() < MATE_BOUND {
             continue; // ran out of budget: a half-checked sacrifice is not played
         }
